@@ -3076,6 +3076,598 @@ class HAMQTTBridge:
         self._client.publish(self.threat_topic, json.dumps(payload, default=str),
                              qos=1, retain=False)
 
+# ============================================================================
+# SECTION 23 — Web UI
+#   23.1  _INDEX_HTML       dashboard template
+#   23.2  _REPLAY_HTML      replay template
+#   23.3  _VizHandler       HTTP handler (routes + per-endpoint bodies)
+#   23.4  start_web         server bootstrap
+# ============================================================================
+
+# ---------------------------------------------------------------- 23.1 -----
+_INDEX_HTML = """<!DOCTYPE html><html><head><title>DHMZ Radar Nowcaster</title>
+<style>
+body{background:#111;color:#ddd;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:20px}
+h1{color:#fff;margin-top:0;display:flex;align-items:center;gap:12px;flex-wrap:wrap}.layout{display:flex;gap:20px;flex-wrap:wrap}
+.left{flex:1 1 470px;max-width:580px}.right{flex:2 1 600px}
+.section{background:#1a1a1a;border:1px solid #333;border-radius:4px;padding:12px;margin-bottom:12px}
+.section h3{margin:0 0 8px 0;font-size:13px;text-transform:uppercase;color:#5cf;letter-spacing:0.5px;display:flex;justify-content:space-between;align-items:center}
+.field{display:flex;align-items:center;margin-bottom:6px;font-size:13px}
+.field label{flex:1;color:#ccc}.field input[type=number]{width:90px;background:#0a0a0a;color:#ddd;border:1px solid #333;padding:4px;border-radius:3px}
+.field input[type=text]{flex:0 0 160px;background:#0a0a0a;color:#ddd;border:1px solid #333;padding:4px;border-radius:3px}
+.field select{width:130px;background:#0a0a0a;color:#ddd;border:1px solid #333;padding:4px;border-radius:3px}
+.field input[type=checkbox]{accent-color:#5cf;width:18px;height:18px}
+.actions{margin-top:8px;display:flex;gap:8px;flex-wrap:wrap}
+button{background:#2a5c8a;color:#fff;border:0;padding:7px 12px;border-radius:3px;cursor:pointer;font-size:12px}
+button:hover{background:#3a7cba}button.secondary{background:#444}
+button.secondary:hover{background:#555}button.danger{background:#8a2a2a}
+button.danger:hover{background:#ba3a3a}
+.status{background:#1a1a1a;border:1px solid #333;border-radius:4px;padding:12px;margin-bottom:12px;font-size:13px}
+.status .row{display:flex;margin-bottom:4px}.status .label{color:#888;flex:0 0 160px}
+.wx-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.wx-box{background:#121519;border:1px solid #282c34;border-radius:4px;padding:7px 8px}
+.wx-k{font-size:11px;color:#888;text-transform:uppercase}
+.wx-v{font-size:15px;font-weight:600;color:#fff;margin-top:2px;font-variant-numeric:tabular-nums}
+.wx-sub{font-size:11px;color:#9aa}
+table.acc{width:100%;border-collapse:collapse;font-size:12px}
+table.acc th,table.acc td{padding:4px 6px;text-align:left;border-bottom:1px solid #252830}
+table.acc th{color:#5cf;font-weight:normal;text-transform:uppercase;font-size:11px}
+table.acc td.num{text-align:right;font-variant-numeric:tabular-nums}
+img{max-width:100%;border:1px solid #333;display:block;margin-bottom:12px}
+a{color:#5cf}.hint{color:#778;font-size:11px;margin-top:4px}
+.cfgpath{font-family:monospace;color:#7c7}
+.badge{background:#244866;color:#9df;padding:3px 8px;border-radius:3px;font-size:12px;text-decoration:none}
+</style></head><body>
+<h1>DHMZ Radar Nowcaster <a class="badge" href="/replay">Offline Replay →</a></h1>
+<p><a href="/threat.gif">/threat.gif</a> · <a href="/threat.png">/threat.png</a> · <a href="/status">/status</a> · <a href="/settings">/settings</a> · <a href="/config">/config</a> · <a href="/archive">/archive</a> · <a href="/accuracy">/accuracy</a></p>
+<div class="layout">
+<div class="left">
+<div class="status" id="status">Loading...</div>
+<div class="section"><h3>Local Weather (Pljusak)</h3>
+<div id="local_wx">Loading...</div>
+</div>
+<div class="section"><h3>Storm Frame Archive</h3>
+<div id="archive_box">Loading...</div>
+</div>
+<div class="section"><h3>Accuracy</h3>
+<div id="accuracy">Loading...</div>
+<div class="actions" style="margin-top:8px">
+<button class="secondary" onclick="replayAccuracy()">Replay scores</button>
+<button class="danger" onclick="resetAccuracy()">Reset scores</button>
+</div></div>
+<div class="section"><h3>Sensors (HA)</h3>
+<div id="sensors">Loading...</div>
+</div>
+<div class="section"><h3>Runtime settings (hot)</h3>
+<div class="field"><label>Focus radius (km)</label><input type="number" id="focus_radius_km" min="20" max="1000" step="10"></div>
+<div class="field"><label>Threat radius (km)</label><input type="number" id="threat_radius_km" min="1" max="500" step="5"></div>
+<div class="field"><label>Arrival pixel threshold</label><input type="number" id="arrival_pixel_threshold" min="1" max="5000" step="5"></div>
+<div class="field"><label>Departure pixel threshold</label><input type="number" id="departure_pixel_threshold" min="1" max="5000" step="5"></div>
+<div class="field"><label>Max horizon (min)</label><input type="number" id="max_horizon_min" min="30" max="360" step="10"></div>
+<div class="field"><label>Min cell size (px)</label><input type="number" id="min_size_px" min="5" max="5000" step="5"></div>
+<div class="field"><label>Map radius (km)</label><input type="number" id="radius_km" min="20" max="1000" step="10"></div>
+<div class="field"><label>Local weather radius (km)</label><input type="number" id="weather_radius_km" min="0.5" max="100" step="0.5"></div>
+<div class="field"><label>Archive frames</label><input type="checkbox" id="archive_enabled"></div>
+<div class="field"><label>Archive radius (km)</label><input type="number" id="archive_radius_km" min="20" max="500" step="10"></div>
+<div class="field"><label>Precompute replay PNGs</label><input type="checkbox" id="archive_precompute_replay"></div>
+<div class="field"><label>Fit check overlay (raw DHMZ @ 30%)</label><input type="checkbox" id="fit_check_overlay"></div>
+<div class="field"><label>View rotation: auto</label><input type="checkbox" id="view_rotation_auto"></div>
+<div class="field"><label>View rotation (° CW, up)</label><input type="number" id="view_rotation" min="0" max="360" step="5"></div>
+<div class="field"><label>Basemap</label>
+<select id="basemap">
+<option value="auto">auto</option><option value="mapbox">mapbox</option>
+<option value="greyscale">greyscale</option><option value="none">none</option>
+</select></div>
+<div class="field"><label>Basemap saturation</label><input type="number" id="basemap_saturation" min="0" max="2" step="0.1"></div>
+<div class="field"><label>Basemap brightness</label><input type="number" id="basemap_brightness" min="0.2" max="2" step="0.05"></div>
+<div class="field"><label>Basemap contrast</label><input type="number" id="basemap_contrast" min="0.2" max="2" step="0.05"></div>
+<div class="field"><label>Cities</label><input type="checkbox" id="show_cities"></div>
+<div class="field"><label>Poll interval (s)</label><input type="number" id="poll_s" min="30" max="7200" step="30"></div>
+<div class="field"><label>Image scale</label><input type="number" id="web_scale" min="0.1" max="4" step="0.1"></div>
+<div class="field"><label>Settings tag</label><input type="text" id="settings_tag"></div>
+<div class="actions">
+<button onclick="saveAll(false)">Save</button>
+<button onclick="saveAll(true)">Save & refresh</button>
+</div></div>
+</div>
+<div class="right">
+<img id="g" src="/threat.gif">
+<img id="p" src="/threat.png">
+</div>
+</div>
+<script>
+const RT_FIELDS=['focus_radius_km','threat_radius_km','arrival_pixel_threshold','departure_pixel_threshold','max_horizon_min','min_size_px','radius_km','weather_radius_km','archive_enabled','archive_radius_km','archive_precompute_replay','fit_check_overlay','view_rotation_auto','view_rotation','basemap','basemap_saturation','basemap_brightness','basemap_contrast','show_cities','poll_s','web_scale','settings_tag'];
+const MAIN_SENSORS=['raining_now','raining_confirmed','rain_confidence','rain_duration_min','rain_end_eta_min','next_rain_eta_min','gap_min','summary','radar_intensity_mmh','nearest_station_mm','intensity_mmh','station_trend','local_temp_c','local_humidity','local_pressure_hpa','local_wind_speed_kmh','local_wind_gust_kmh','local_wind_dir','local_rain_today_mm','local_rain_1h_mm','local_rain_rate_mmh'];
+const DIAG_SENSORS=['nowcast_error_min','data_age_min','frame_timestamp','cluster_count','nearest_cell_eta_min','nearest_station_km','nearest_station_age_min','station_count_wet','station_count_fresh','station_wet_fraction','station_median_mm','local_weather_stations'];
+function setField(k,v){const el=document.getElementById(k);if(!el)return;if(el.type==='checkbox')el.checked=!!v;else el.value=v;}
+function getField(k){const el=document.getElementById(k);if(!el)return null;if(el.type==='checkbox')return el.checked;if(k==='settings_tag'||k==='basemap')return el.value;return parseFloat(el.value);}
+function loadSettings(){fetch('/settings').then(r=>r.json()).then(s=>{RT_FIELDS.forEach(k=>{if(k in s)setField(k,s[k]);});});}
+function saveAll(refresh){const body={};RT_FIELDS.forEach(k=>body[k]=getField(k));
+ fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+ .then(r=>r.json()).then(d=>{if(d.ok&&refresh)return fetch('/refresh',{method:'POST'});})
+ .then(()=>{bumpImages();loadStatus();});}
+function fmtVal(v){if(v===null||v===undefined)return '—';if(typeof v==='boolean')return v?'yes':'no';return String(v);}
+function loadStatus(){fetch('/status').then(r=>r.json()).then(s=>{const el=document.getElementById('status');if(!s||!s.updated){el.textContent='No data yet';return;}
+ el.innerHTML=`<div class="row"><span class="label">Target</span><span>${s.target||'?'}</span></div>
+ <div class="row"><span class="label">Updated</span><span>${s.updated}</span></div>
+ <div class="row"><span class="label">Confidence</span><span>${s.confidence||'?'}</span></div>
+ <div class="row"><span class="label">Raining</span><span>${s.raining_now?'yes':'no'}</span></div>
+ <div class="row"><span class="label">Nowcast</span><span>${s.summary||'—'}</span></div>
+ <div class="row"><span class="label">View rotation</span><span>${s.view_rotation_used!=null?s.view_rotation_used.toFixed(0)+'°'+(s.view_rotation_auto?' (auto)':'') :'—'}</span></div>
+ <div class="row"><span class="label">Basemap</span><span>${s.basemap_used||'—'}</span></div>
+ <div class="row"><span class="label">Config</span><span class="cfgpath">${s.config_path||'(not persisted)'}</span></div>`;
+ const arch=s.archive||{};
+ const archEl=document.getElementById('archive_box');
+ if(!arch.archive_dir){archEl.innerHTML='<div class="hint">Persistence disabled (no data-dir)</div>';}
+ else{archEl.innerHTML=`<div class="hint">Status: ${arch.enabled?'Active':'Paused'} (≤${arch.radius_km||100} km) · Episodes: <b>${arch.total_episodes||0}</b> · Frames: <b>${arch.total_frames||0}</b> · Replays: <b>${arch.total_replays||0}</b></div>
+ <div class="hint">Last episode: <span class="cfgpath">${arch.last_episode||'none'}</span> · <a href="/replay">Open Replay</a></div>`;}
+ const wx=s.local_weather||{};
+ const wxEl=document.getElementById('local_wx');
+ if(!wx.station_count){wxEl.innerHTML=`<div class="hint">No fresh Pljusak stations within ${wx.radius_km||5} km</div>`;}
+ else{const windTxt=wx.wind_speed_kmh!=null?`${wx.wind_speed_kmh} km/h`:'—';
+  const gustTxt=wx.wind_gust_kmh!=null?`gust ${wx.wind_gust_kmh}`:'';
+  const dirTxt=wx.wind_dir_deg!=null?`${wx.wind_dir_cardinal} (${wx.wind_dir_deg}°)`:'—';
+  const pTrend=wx.pressure_trend!=null?(wx.pressure_trend>0?'+':'')+wx.pressure_trend+' hPa':'';
+  const tTrend=wx.temp_trend!=null?(wx.temp_trend>0?'+':'')+wx.temp_trend+'°/h':'';
+  wxEl.innerHTML=`<div class="wx-grid">
+   <div class="wx-box"><div class="wx-k">Temp</div><div class="wx-v">${wx.temp_c!=null?wx.temp_c+' °C':'—'}</div><div class="wx-sub">${tTrend||' '}</div></div>
+   <div class="wx-box"><div class="wx-k">Humidity</div><div class="wx-v">${wx.humidity_pct!=null?wx.humidity_pct+' %':'—'}</div></div>
+   <div class="wx-box"><div class="wx-k">Pressure</div><div class="wx-v">${wx.pressure_hpa!=null?wx.pressure_hpa+' hPa':'—'}</div><div class="wx-sub">${pTrend||' '}</div></div>
+   <div class="wx-box"><div class="wx-k">Wind</div><div class="wx-v">${windTxt}</div><div class="wx-sub">${gustTxt||' '}</div></div>
+   <div class="wx-box"><div class="wx-k">Heading</div><div class="wx-v">${dirTxt}</div></div>
+   <div class="wx-box"><div class="wx-k">Rain (Today / 1h)</div><div class="wx-v">${wx.precip_today_mm!=null?wx.precip_today_mm:'—'} / ${wx.precip_1h_mm!=null?wx.precip_1h_mm:'—'} mm</div><div class="wx-sub">${wx.rain_rate_mmh!=null?wx.rain_rate_mmh+' mm/h':' '}</div></div>
+  </div>
+  <div class="hint" style="margin-top:6px">${wx.station_count} fresh ≤ ${wx.radius_km} km · nearest: ${wx.nearest_station||'?'} (${wx.nearest_dist_km} km)</div>`;}
+ const sensors=s.sensors||{};
+ let html='<table class="acc"><tr><th>Sensor</th><th>Value</th></tr>';
+ for(const k of MAIN_SENSORS){html+=`<tr><td>${k}</td><td class="num">${fmtVal(sensors[k])}</td></tr>`;}
+ html+='</table><h4>Diagnostic</h4><table class="acc">';
+ for(const k of DIAG_SENSORS){html+=`<tr><td>${k}</td><td class="num">${fmtVal(sensors[k])}</td></tr>`;}
+ html+='</table>';
+ document.getElementById('sensors').innerHTML=html;
+});}
+function loadAccuracy(){fetch('/accuracy').then(r=>r.json()).then(a=>{const el=document.getElementById('accuracy');
+ if(!a){el.innerHTML='<div class="hint">No accuracy data</div>';return;}
+ let html='<div class="hint">Preds '+a.total_predictions+' · Outcomes '+a.total_outcomes+' · Scores '+a.total_scores+' · Expired '+(a.expired_predictions||0)+' · Superseded '+(a.superseded_predictions||0)+'</div>';
+ const pend=a.pending_by_kind||{};
+ if(Object.keys(pend).length){html+='<div class="hint">Pending: '+Object.entries(pend).map(([k,v])=>k+':'+v).join(', ')+'</div>';}
+ if(a.total_scores>0){const order=['cluster_arrive','rain_start','rain_end','threat'];
+  html+='<table class="acc"><tr><th>Kind</th><th>N</th><th>Median err</th><th>Median abs</th><th>Mean abs</th><th>p90 abs</th></tr>';
+  for(const k of order){const v=a.by_kind[k];if(!v||!v.n)continue;
+   const bias=v.median_error_min!=null?(v.median_error_min>0?'+':'')+v.median_error_min.toFixed(0):'—';
+   html+=`<tr><td>${k}</td><td class="num">${v.n}</td><td class="num">${bias}</td><td class="num">${v.median_abs_error_min.toFixed(1)}</td><td class="num">${v.mean_abs_error_min.toFixed(1)}</td><td class="num">${v.p90_abs_error_min.toFixed(1)}</td></tr>`;}
+  html+='</table>';
+  const tags=Object.keys(a.by_tag||{});
+  if(tags.length){html+='<h4>By tag</h4><table class="acc"><tr><th>Tag</th><th>N</th><th>Median abs</th></tr>';
+   for(const t of tags){const v=a.by_tag[t];if(!v||!v.n)continue;
+    html+=`<tr><td>${t||'(untagged)'}</td><td class="num">${v.n}</td><td class="num">${v.median_abs_error_min.toFixed(1)}</td></tr>`;}
+   html+='</table>';}}
+ el.innerHTML=html;
+});}
+function replayAccuracy(){if(!confirm('Re-score all predictions?'))return;fetch('/accuracy/replay',{method:'POST'}).then(()=>loadAccuracy());}
+function resetAccuracy(){if(!confirm('Clear all scores?'))return;fetch('/accuracy/reset',{method:'POST'}).then(()=>loadAccuracy());}
+function bumpImages(){const t=Date.now();document.getElementById('g').src='/threat.gif?t='+t;document.getElementById('p').src='/threat.png?t='+t;}
+loadSettings();loadStatus();loadAccuracy();
+setInterval(loadStatus,10000);setInterval(loadAccuracy,30000);setInterval(bumpImages,60000);
+</script></body></html>"""
+
+
+# ---------------------------------------------------------------- 23.2 -----
+_REPLAY_HTML = """<!DOCTYPE html><html><head><title>Offline Replay — DHMZ Radar</title>
+<style>
+body{background:#0e1014;color:#dde;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:18px}
+h1{color:#fff;margin:0 0 12px 0;font-size:20px;display:flex;align-items:center;gap:12px}
+.badge{background:#233547;color:#7cf;padding:3px 8px;border-radius:3px;font-size:12px;text-decoration:none}
+.grid{display:flex;gap:18px;flex-wrap:wrap}
+.col-left{flex:1 1 520px;max-width:760px}
+.col-right{flex:1 1 320px;max-width:420px}
+.card{background:#161a20;border:1px solid #2b323d;border-radius:5px;padding:12px;margin-bottom:14px}
+.card h3{margin:0 0 8px 0;font-size:12px;text-transform:uppercase;color:#6cf;letter-spacing:0.6px}
+.row{display:flex;align-items:center;gap:8px;margin-bottom:7px;font-size:13px}
+.row label{flex:1;color:#bcc}
+button{background:#265b8c;color:#fff;border:0;padding:7px 12px;border-radius:3px;cursor:pointer;font-size:12px;font-weight:500}
+button:hover{background:#3477b5}
+button.secondary{background:#383f4a}button.secondary:hover{background:#4a5362}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{padding:5px 6px;text-align:left;border-bottom:1px solid #242a34}
+th{color:#7cf;font-size:11px;text-transform:uppercase;font-weight:500}
+td.num{text-align:right;font-variant-numeric:tabular-nums}
+.scrubber{display:flex;align-items:center;gap:8px;margin-top:8px}
+.scrubber input[type=range]{flex:1;accent-color:#6cf}
+img#replay_img{width:100%;max-width:720px;border:1px solid #2b323d;border-radius:4px;display:block;background:#080a0d}
+.hint{color:#778;font-size:11px;margin-top:4px;line-height:1.4}
+</style></head><body>
+<h1>Offline Replay <a class="badge" href="/">← Live Dashboard</a></h1>
+
+<div class="grid">
+  <div class="col-left">
+    <div class="card">
+      <h3>Archived Storm Episode</h3>
+      <div class="row">
+        <label>Episode</label>
+        <select id="ep_select" onchange="onEpisodeChange()" style="flex:1;background:#0b0d10;color:#eee;border:1px solid #333b48;padding:4px 6px;border-radius:3px"></select>
+        <button class="secondary" onclick="loadEpisodes()">Reload</button>
+      </div>
+      <div id="ep_meta" class="hint">Loading archived episodes...</div>
+      <div class="scrubber">
+        <button class="secondary" onclick="stepFrame(-1)">◀</button>
+        <button id="play_btn" class="secondary" onclick="togglePlay()">▶ Play</button>
+        <button class="secondary" onclick="stepFrame(1)">▶</button>
+        <input type="range" id="frame_slider" min="0" max="0" value="0" oninput="renderFrame()">
+        <span id="frame_lbl" style="font-size:12px;min-width:52px;text-align:right">0/0</span>
+      </div>
+      <div class="hint" style="margin-top:6px">
+        Images are precomputed at archive time — should load instantly.
+      </div>
+    </div>
+    <img id="replay_img" alt="Archived radar frame">
+  </div>
+
+  <div class="col-right">
+    <div class="card">
+      <h3>Episodes</h3>
+      <div id="episodes_box" class="hint">Loading...</div>
+    </div>
+    <div class="card">
+      <h3>Tips</h3>
+      <div class="hint">
+        Play runs at ~2 fps. Frames with precomputed replays load instantly.
+        Toggle fit-check overlay on the dashboard to see the raw DHMZ frame
+        semi-transparently.
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let episodes=[];
+let playTimer=null;
+
+function loadEpisodes(){
+  fetch('/archive?n=50').then(r=>r.json()).then(d=>{
+    episodes=d.episodes||[];
+    const sel=document.getElementById('ep_select');
+    sel.innerHTML='';
+    if(!episodes.length){
+      document.getElementById('ep_meta').textContent='No archived storm episodes yet.';
+      document.getElementById('episodes_box').textContent='No episodes.';
+      return;
+    }
+    episodes.forEach(ep=>{
+      const opt=document.createElement('option');
+      opt.value=ep.episode_id;
+      opt.textContent=`${ep.episode_id} (${ep.frame_count} fr, peak ${ep.peak_sri_mmh||'?'} mm/h${ep.target_hit?' · HIT':''})`;
+      sel.appendChild(opt);
+    });
+    let html='<table><tr><th>Episode</th><th class="num">Frames</th><th class="num">Peak</th><th>Hit</th></tr>';
+    episodes.forEach(ep=>{
+      html+=`<tr><td>${ep.episode_id}</td><td class="num">${ep.frame_count||0}</td><td class="num">${ep.peak_sri_mmh||'—'}</td><td>${ep.target_hit?'✓':'—'}</td></tr>`;
+    });
+    html+='</table>';
+    document.getElementById('episodes_box').innerHTML=html;
+    onEpisodeChange();
+  });
+}
+
+function onEpisodeChange(){
+  const epId=document.getElementById('ep_select').value;
+  const ep=episodes.find(e=>e.episode_id===epId);
+  const slider=document.getElementById('frame_slider');
+  if(!ep)return;
+  const maxIdx=Math.max(0,(ep.frame_count||1)-1);
+  slider.max=maxIdx;
+  slider.value=maxIdx;
+  document.getElementById('ep_meta').textContent=`Start: ${ep.start_utc||'?'} · End: ${ep.end_utc||'?'} · Peak SRI: ${ep.peak_sri_mmh||0} mm/h`;
+  renderFrame();
+}
+
+function stepFrame(delta){
+  const slider=document.getElementById('frame_slider');
+  const next=Math.max(0,Math.min(parseInt(slider.max),parseInt(slider.value)+delta));
+  slider.value=next;
+  renderFrame();
+}
+
+function togglePlay(){
+  const btn=document.getElementById('play_btn');
+  if(playTimer){clearInterval(playTimer);playTimer=null;btn.textContent='▶ Play';return;}
+  btn.textContent='⏸ Pause';
+  playTimer=setInterval(()=>{
+    const slider=document.getElementById('frame_slider');
+    let v=parseInt(slider.value)+1;
+    if(v>parseInt(slider.max))v=0;
+    slider.value=v;
+    renderFrame();
+  },450);
+}
+
+function renderFrame(){
+  const epId=document.getElementById('ep_select').value;
+  const slider=document.getElementById('frame_slider');
+  const idx=parseInt(slider.value)||0;
+  const total=parseInt(slider.max)+1;
+  document.getElementById('frame_lbl').textContent=`${idx+1}/${total}`;
+  if(!epId)return;
+  // ?t= forces a fresh request (server-side cache handles speed)
+  document.getElementById('replay_img').src=`/replay/frame?episode=${encodeURIComponent(epId)}&idx=${idx}&t=${Date.now()}`;
+}
+
+loadEpisodes();
+</script></body></html>"""
+
+
+# ---------------------------------------------------------------- 23.3 -----
+class _VizHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = {}
+        for part in qs.split("&"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                params[k] = v
+        if path == "/":
+            self._html(_INDEX_HTML)
+        elif path == "/replay":
+            self._html(_REPLAY_HTML)
+        elif path == "/replay/frame":
+            self._replay_frame(params)
+        elif path == "/threat.png":
+            self._bytes("png", "image/png")
+        elif path == "/threat.gif":
+            self._bytes("gif", "image/gif")
+        elif path == "/status":
+            self._status()
+        elif path == "/settings":
+            self._json(_snapshot())
+        elif path == "/config":
+            self._config_get()
+        elif path == "/archive":
+            self._archive(params)
+        elif path == "/accuracy":
+            self._accuracy(params)
+        elif path == "/accuracy/predictions":
+            self._accuracy_predictions(params)
+        elif path == "/accuracy/events":
+            self._accuracy_events(params)
+        else:
+            self.send_response(404); self.end_headers()
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if path == "/settings":
+            self._settings_post()
+        elif path == "/config":
+            self._config_post()
+        elif path == "/refresh":
+            _FORCE_REFRESH.set()
+            self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
+        elif path == "/accuracy/reset":
+            acc = _VIZ_STATE.get("acc_store")
+            if acc: acc.reset_scores()
+            self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
+        elif path == "/accuracy/replay":
+            acc = _VIZ_STATE.get("acc_store")
+            if acc: acc.replay()
+            self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
+        else:
+            self.send_response(404); self.end_headers()
+
+    def do_DELETE(self):
+        path = self.path.split("?")[0]
+        if path == "/config":
+            cfg_path = _VIZ_STATE.get("config_path")
+            if cfg_path:
+                for p in (cfg_path, cfg_path + ".bak"):
+                    try: os.remove(p)
+                    except FileNotFoundError: pass
+            self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
+        else:
+            self.send_response(404); self.end_headers()
+
+    def _read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(length)) if length > 0 else {}
+        except Exception:
+            return None
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers(); self.wfile.write(body)
+
+    def _bytes(self, key, ctype):
+        with _VIZ_STATE["lock"]:
+            data = _VIZ_STATE[key]
+        if data is None:
+            self.send_response(503); self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "9"); self.end_headers()
+            self.wfile.write(b"not ready"); return
+        self.send_response(200); self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache, max-age=0")
+        self.end_headers(); self.wfile.write(data)
+
+    def _status(self):
+        with _VIZ_STATE["lock"]:
+            status = dict(_VIZ_STATE["status"])
+        status["config_path"] = _VIZ_STATE.get("config_path")
+        self._json(status)
+
+    def _archive(self, params):
+        arch = _VIZ_STATE.get("archiver")
+        if not arch:
+            self._json({"enabled": False, "episodes": []}); return
+        limit = int(params.get("n", 30))
+        res = arch.summary()
+        res["episodes"] = arch.list_episodes(limit=limit)
+        self._json(res)
+
+    def _replay_frame(self, params):
+        import urllib.parse
+        eng = _VIZ_STATE.get("replay_engine")
+        arch = _VIZ_STATE.get("archiver")
+        if not eng:
+            self.send_response(503); self.end_headers(); return
+        ep_id = urllib.parse.unquote(params.get("episode", ""))
+        try:
+            idx = int(params.get("idx", 0))
+        except (ValueError, TypeError):
+            idx = 0
+
+        data = eng.get_episode_data(ep_id)
+        if not data:
+            self.send_response(404); self.end_headers(); return
+        idx = max(0, min(len(data) - 1, idx))
+        rt = _snapshot()
+        st = _static_snapshot()
+
+        # Fast path: precomputed replay PNG for this exact params hash
+        if arch is not None:
+            _, fpath, fname = data[idx]
+            ph = _replay_params_hash(rt, st)
+            precomputed = arch.find_replay_png(ep_id, fname, ph)
+            if precomputed is not None:
+                try:
+                    with open(precomputed, "rb") as fh:
+                        out = fh.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Length", str(len(out)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers(); self.wfile.write(out)
+                    return
+                except Exception as e:
+                    print(f"replay: precomputed read error {e}", file=sys.stderr)
+
+        # Slow path: render on demand, with in-memory cache
+        cache_key = (ep_id, idx, _replay_params_hash(rt, st))
+        cached = _replay_cache_get(cache_key)
+        if cached is not None:
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(cached)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers(); self.wfile.write(cached)
+            return
+
+        flows = eng.get_flows(ep_id, data)
+        flow = combined_flow(flows, idx, int(rt["flow_average_pairs"]),
+                             smooth_sigma=float(rt.get("flow_smooth_sigma", 2.0)))
+        if flow is None:
+            m_shape = data[idx][1].shape
+            flow = np.zeros((*m_shape, 2), dtype=np.float32)
+
+        ts, mask, mmh, fpath, _ = data[idx]
+
+        # Load the raw frame if fit-check overlay is requested
+        raw_img = None
+        if rt.get("fit_check_overlay"):
+            try:
+                raw_img = Image.open(fpath).convert("RGB")
+            except Exception as e:
+                print(f"replay: raw frame load error {e}", file=sys.stderr)
+
+        try:
+            png = build_replay_png(
+                raw_img, mask, mmh, flow, eng.calib, ts, idx, len(data), ep_id,
+                eng.target_lat, eng.target_lon, rt, st,
+                eng.sri_legend, None,
+                stations=[],
+                data_dir=_VIZ_STATE.get("data_dir"))
+        except Exception as e:
+            print(f"replay: on-demand render error {e}", file=sys.stderr)
+            self.send_response(500); self.end_headers(); return
+
+        _replay_cache_put(cache_key, png)
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(png)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers(); self.wfile.write(png)
+
+    def _config_get(self):
+        cfg_path = _VIZ_STATE.get("config_path")
+        if cfg_path and os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if cfg.get("static", {}).get("mapbox_token"):
+                cfg["static"]["mapbox_token"] = "***"
+            self._json(cfg)
+        else:
+            self._json({"version": 2, "note": "no config persisted",
+                        "runtime": _snapshot(), "static": _static_snapshot()})
+
+    def _config_post(self):
+        new_cfg = self._read_json_body()
+        if not isinstance(new_cfg, dict):
+            self._json({"ok": False, "error": "bad request"}, 400); return
+        cfg_path = _VIZ_STATE.get("config_path")
+        if not cfg_path:
+            self._json({"ok": False, "error": "no config path"}, 400); return
+        existing = _load_json_file(cfg_path) or {}
+        now = datetime.now(timezone.utc).isoformat()
+        if new_cfg.get("static", {}).get("mapbox_token") == "***":
+            new_cfg["static"]["mapbox_token"] = existing.get("static", {}).get("mapbox_token")
+        new_cfg.setdefault("version", 2)
+        new_cfg.setdefault("created_at", existing.get("created_at", now))
+        new_cfg["updated_at"] = now
+        if _save_json_file(cfg_path, new_cfg):
+            self._json({"ok": True, "restart_required": True, "path": cfg_path})
+        else:
+            self._json({"ok": False, "error": "save failed"}, 500)
+
+    def _accuracy(self, params):
+        acc = _VIZ_STATE.get("acc_store")
+        if not acc:
+            self._json({"error": "disabled"}, 503); return
+        self._json(acc.stats(since_hours=float(params["since_hours"]) if "since_hours" in params else None,
+                             tag=params.get("tag")))
+
+    def _accuracy_predictions(self, params):
+        acc = _VIZ_STATE.get("acc_store")
+        if not acc:
+            self._json({"error": "disabled"}, 503); return
+        self._json(acc.list_predictions(limit=int(params.get("n", 100))))
+
+    def _accuracy_events(self, params):
+        acc = _VIZ_STATE.get("acc_store")
+        if not acc:
+            self._json({"error": "disabled"}, 503); return
+        self._json(acc.list_outcomes(limit=int(params.get("n", 100))))
+
+    def _settings_post(self):
+        new = self._read_json_body()
+        if not isinstance(new, dict):
+            self._json({"ok": False, "error": "bad json"}, 400); return
+        with _RUNTIME_LOCK:
+            for k, v in new.items():
+                if k in _RUNTIME_TYPES:
+                    _RUNTIME[k] = _coerce(k, v)
+            current = dict(_RUNTIME)
+        _persist_runtime_to_disk()
+        self._json({"ok": True, "settings": current})
+
+    def _html(self, s):
+        body = s.encode("utf-8")
+        self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+# ---------------------------------------------------------------- 23.4 -----
+def start_web(port):
+    srv = ThreadingHTTPServer(("0.0.0.0", port), _VizHandler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return srv
 
 # ============================================================================
 # SECTION 22 — Replay rendering (shared between archive precompute and on-demand)
