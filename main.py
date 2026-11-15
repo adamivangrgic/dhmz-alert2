@@ -48,6 +48,7 @@ import yaml
 from PIL import Image, ImageDraw, ImageEnhance, ImageSequence
 from scipy import ndimage
 from scipy.spatial import cKDTree
+import hashlib
 
 try:
     import pytesseract
@@ -1042,6 +1043,24 @@ def fetch_image(url, timeout=30):
     return Image.open(io.BytesIO(r.content))
 
 
+def _dedupe_trailing_static_frames(frames):
+    """Drop trailing frames pixel-identical to the last frame, keeping the
+    FIRST frame of the trailing static run so that indices stay contiguous
+    from zero and every downstream img.seek(idx) remains valid.
+
+    Returns (deduped_frames, original_length).
+    """
+    if len(frames) < 2:
+        return frames, len(frames)
+    last_hash = hashlib.md5(frames[-1].tobytes()).hexdigest()
+    keep_from = len(frames) - 1
+    while keep_from > 0:
+        if hashlib.md5(frames[keep_from - 1].tobytes()).hexdigest() != last_hash:
+            break
+        keep_from -= 1
+    return frames[:keep_from + 1], len(frames)
+
+
 def compute_rgb_and_mask(frame):
     rgb = np.asarray(frame.convert("RGB"), dtype=np.float32)
     r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
@@ -1655,8 +1674,10 @@ def track_frame_sequence(frame_masks_mmh, calib, frame_interval_min,
 
 def track_animation(img, calib, frame_interval_min, target_lat, target_lon,
                     intensity_mode, sri_legend, legend_mask, rt=None):
+    raw = [f.convert("RGB") for f in ImageSequence.Iterator(img)]
+    raw, _original_count = _dedupe_trailing_static_frames(raw)
     frame_masks_mmh = []
-    for frame in ImageSequence.Iterator(img):
+    for frame in raw:
         mask, mmh = analyze_frame(frame, calib.map_region, intensity_mode,
                                   sri_legend, legend_mask)
         frame_masks_mmh.append((mask, mmh))
@@ -3308,8 +3329,9 @@ def render_composed_gif(img, calib, target_lat, target_lon, radius_km,
                         threat_flags, stations, show_cities,
                         intensity_mode, sri_legend, legend_mask,
                         sri_thresholds, rt, confirm_mm=0.2,
+                        n_unique_frames=None,
                         frame_duration_ms=400, max_frames=30):
-    nf = getattr(img, "n_frames", 1)
+    nf = n_unique_frames if n_unique_frames is not None else getattr(img, "n_frames", 1)
     start = max(0, nf - max_frames)
     split_frames_by_id = split_frames_by_id or {}
     base_win = float(rt.get("velocity_window_min", VELOCITY_WINDOW_MIN))
@@ -5267,7 +5289,8 @@ def main():
                 approaches, approaching_flags, threat_flags,
                 stations, rt["show_cities"],
                 st["radar_intensity"], sri_legend, legend_mask,
-                sri_thresholds, rt, confirm_mm=st["station_confirm_min_mm"])
+                sri_thresholds, rt, confirm_mm=st["station_confirm_min_mm"],
+                n_unique_frames=len(frame_masks_mmh))
 
             px_t, py_t = calib.latlon_to_image_pixel(target_lat, target_lon)
             xi, yi = int(round(px_t)), int(round(py_t))
