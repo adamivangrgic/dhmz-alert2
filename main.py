@@ -197,19 +197,20 @@ ADRIATIC_COAST = [
 
 _RUNTIME = {
     # Local scope
-    "focus_radius_km": 120.0,        # tracking is cropped to this radius
-    "threat_radius_km": 20.0,        # arrival/departure counting region
-    "arrival_pixel_threshold": 20,   # pixels inside threat_radius = "arrived"
-    "departure_pixel_threshold": 20, # pixels inside threat_radius = "still raining"
+    "focus_radius_km": 120.0,
+    "threat_radius_km": 20.0,
+    "arrival_pixel_threshold": 20,
+    "departure_pixel_threshold": 20,
     "max_horizon_min": 120.0,
     "step_min": 5.0,
     "min_size_px": 20,
     "min_sri_mmh": 0.0,
     # Flow field
     "flow_downsample": 2,
-    "flow_block_px": 16,
-    "flow_search_px": 8,
-    "flow_average_pairs": 3,
+    "flow_block_px": 24,          # was 16 — larger blocks, more signal per correlation
+    "flow_search_px": 10,         # was 8 — wider search for fast storms
+    "flow_average_pairs": 5,      # was 3 — 25 min temporal average, smoother
+    "flow_smooth_sigma": 2.0,     # NEW — spatial Gaussian on the flow field
     # View
     "radius_km": 80.0,
     "weather_radius_km": 5.0,
@@ -243,6 +244,7 @@ _RUNTIME_TYPES = {
     "flow_block_px": (int, 6, 64),
     "flow_search_px": (int, 2, 32),
     "flow_average_pairs": (int, 1, 8),
+    "flow_smooth_sigma": (float, 0.0, 8.0),
     "radius_km": (float, 20.0, 1000.0),
     "weather_radius_km": (float, 0.5, 100.0),
     "view_rotation_auto": (bool, None, None),
@@ -1081,7 +1083,6 @@ def estimate_flow_field(prev_mask, curr_mask, block_px=16, search_px=8, downsamp
 
     best_dy = np.zeros((ny, nx), dtype=np.int32)
     best_dx = np.zeros((ny, nx), dtype=np.int32)
-    best_score = np.full((ny, nx), -np.inf, dtype=np.float32)
 
     for by in range(ny):
         y0 = by * block_px
@@ -1098,9 +1099,7 @@ def estimate_flow_field(prev_mask, curr_mask, block_px=16, search_px=8, downsamp
             idx = np.unravel_index(np.argmax(corr), corr.shape)
             best_dy[by, bx] = idx[0] - pad
             best_dx[by, bx] = idx[1] - pad
-            best_score[by, bx] = float(corr[idx])
 
-    # Assemble low-res flow, then upscale by repeating block vectors
     flow_low = np.zeros((ny * block_px, nx * block_px, 2), dtype=np.float32)
     for by in range(ny):
         for bx in range(nx):
@@ -1116,35 +1115,77 @@ def estimate_flow_field(prev_mask, curr_mask, block_px=16, search_px=8, downsamp
         padded[:flow_full.shape[0], :flow_full.shape[1]] = flow_full
         flow_full = padded
 
-    # Convert from downsample pixels/frame to full pixels/frame
     flow_full *= downsample
     return flow_full[:H, :W]
 
 
-def combined_flow(flows, frame_idx, average_pairs=3):
-    """Return a single flow field for `frame_idx` as the average of the last
-    `average_pairs` flow pairs leading up to that frame."""
+def combined_flow(flows, frame_idx, average_pairs=3, smooth_sigma=2.0):
+    """Temporal mean of the last `average_pairs` flow pairs, then spatially
+    smoothed with a Gaussian.
+
+    Spatial smoothing (sigma in full-resolution pixels) removes block-to-block
+    correlation noise while preserving the broad flow pattern. sigma=2 px
+    is sub-block, sigma=4–8 px smooths within a block, sigma>8 starts to
+    over-smooth storm-scale features.
+    """
     if not flows or frame_idx <= 0:
         return None
     start = max(0, frame_idx - average_pairs)
     window = flows[start:frame_idx]
     if not window:
         return None
-    return np.mean(np.stack(window, axis=0), axis=0)
+    mean = np.mean(np.stack(window, axis=0), axis=0)
+    if smooth_sigma > 0:
+        mean = np.stack([
+            ndimage.gaussian_filter(mean[..., 0], sigma=smooth_sigma, mode='nearest'),
+            ndimage.gaussian_filter(mean[..., 1], sigma=smooth_sigma, mode='nearest'),
+        ], axis=-1).astype(np.float32)
+    return mean
 
 
 def flow_to_kmh(flow_field, calib, frame_interval_min, x, y):
-    """Convert a full-resolution flow vector at (x, y) into (vx_kmh, vy_kmh)
-    with conventional map signs: vx eastward, vy northward."""
+    """Sample a single flow vector at (x, y). Kept for compatibility; prefer
+    cluster_flow_velocity() for display."""
     y_i = max(0, min(flow_field.shape[0] - 1, int(y)))
     x_i = max(0, min(flow_field.shape[1] - 1, int(x)))
     dx_px = float(flow_field[y_i, x_i, 0])
     dy_px = float(flow_field[y_i, x_i, 1])
     kmpp = calib.km_per_pixel(float(x), float(y))
     interval_h = frame_interval_min / 60.0
-    vx_kmh = dx_px * kmpp / interval_h          # eastward
-    vy_kmh = -dy_px * kmpp / interval_h         # image y is south-positive
-    return vx_kmh, vy_kmh
+    return dx_px * kmpp / interval_h, -dy_px * kmpp / interval_h
+
+
+def cluster_flow_velocity(flow_field, label_array, label, calib,
+                          frame_interval_min):
+    """Robust velocity for a cluster: median flow across all its pixels.
+
+    Returns (vx_kmh, vy_kmh, coherence) where coherence ∈ [0, 1] is the
+    circular variance of per-pixel flow directions inside the cluster.
+    Coherence 1.0 = all pixels move the same way (compact, well-defined storm).
+    Coherence 0.0 = pixels move in random directions (deforming complex).
+    Suppress the arrow when coherence < 0.4.
+    """
+    pixels = np.argwhere(label_array == label)
+    if len(pixels) < 4:
+        return 0.0, 0.0, 0.0
+    ys = np.clip(pixels[:, 0], 0, flow_field.shape[0] - 1)
+    xs = np.clip(pixels[:, 1], 0, flow_field.shape[1] - 1)
+    fx = flow_field[ys, xs, 0]
+    fy = flow_field[ys, xs, 1]
+    active = (np.abs(fx) + np.abs(fy)) > 0.01
+    if int(active.sum()) < 4:
+        return 0.0, 0.0, 0.0
+    dx_px = float(np.median(fx[active]))
+    dy_px = float(np.median(fy[active]))
+    angles = np.arctan2(fy[active], fx[active])
+    mean_cos = float(np.cos(angles).mean())
+    mean_sin = float(np.sin(angles).mean())
+    coherence = math.hypot(mean_cos, mean_sin)
+    kmpp = calib.km_per_pixel(float(xs.mean()), float(ys.mean()))
+    interval_h = frame_interval_min / 60.0
+    vx_kmh = dx_px * kmpp / interval_h
+    vy_kmh = -dy_px * kmpp / interval_h
+    return vx_kmh, vy_kmh, coherence
 
 
 # ============================================================================
@@ -1290,6 +1331,7 @@ class ClusterArrival:
     eta_min: Optional[float]
     vx_kmh: float
     vy_kmh: float
+    coherence: float = 1.0
 
 
 def analyze_frame_state(mask, mmh, flow, calib, target_lat, target_lon, rt, st):
@@ -1310,11 +1352,13 @@ def analyze_frame_state(mask, mmh, flow, calib, target_lat, target_lon, rt, st):
             calib, pixels, flow, target_lat, target_lon, fi,
             target_radius_km=target_rad, arrival_px=arrival_thr,
             max_horizon_min=horizon, step_min=step)
-        vx, vy = flow_to_kmh(flow, calib, fi, c.cx, c.cy)
-        arrivals.append(ClusterArrival(cluster=c, eta_min=eta,
-                                       vx_kmh=float(vx), vy_kmh=float(vy)))
+        vx, vy, coherence = cluster_flow_velocity(
+            flow, label_array, c.label, calib, fi)
+        arrivals.append(ClusterArrival(
+            cluster=c, eta_min=eta,
+            vx_kmh=float(vx), vy_kmh=float(vy),
+            coherence=float(coherence)))
 
-    # Nowcast at target
     nc = Nowcast()
     px, py = calib.latlon_to_image_pixel(target_lat, target_lon)
     xi, yi = int(round(px)), int(round(py))
@@ -1330,7 +1374,6 @@ def analyze_frame_state(mask, mmh, flow, calib, target_lat, target_lon, rt, st):
                 target_radius_km=target_rad,
                 departure_px=int(rt["departure_pixel_threshold"]),
                 max_horizon_min=horizon, step_min=step)
-        # Next arrival from any other cluster
         best = None
         for a in arrivals:
             if a.cluster.label == cov_label:
@@ -1354,7 +1397,6 @@ def analyze_frame_state(mask, mmh, flow, calib, target_lat, target_lon, rt, st):
             nc.next_cell_label = best.cluster.label
             nc.next_cell_size = best.cluster.size
 
-    # Summary
     if nc.raining_now:
         parts = ["Raining now."]
         if nc.rain_end_eta_min is not None:
@@ -1446,6 +1488,8 @@ def _replay_params_hash(rt, st):
         "show_cities": rt["show_cities"],
         "basemap": rt["basemap"],
         "web_scale": rt["web_scale"],
+        "flow_smooth_sigma": rt.get("flow_smooth_sigma", 2.0),
+        "flow_average_pairs": rt.get("flow_average_pairs", 5),
         "intensity": st["radar_intensity"],
         "mapbox_style": st.get("mapbox_style"),
         "basemap_size": st.get("basemap_size"),
@@ -1549,8 +1593,6 @@ class StormArchiver:
     def process_animation(self, frames, frame_times, flows, frame_masks_mmh,
                           rt, st, calib, replay_renderer=None,
                           local_weather=None, target_raining=False):
-        """Save raw frames + precomputed replay PNGs. Only new frames get
-        archived; existing frames are skipped (fast file-exists check)."""
         if not self.root_dir or not rt.get("archive_enabled", True):
             return 0
 
@@ -1563,6 +1605,7 @@ class StormArchiver:
         params_hash = _replay_params_hash(rt, st)
         precompute = bool(rt.get("archive_precompute_replay", True)) and replay_renderer is not None
         saved_this_cycle = 0
+        smooth_sigma = float(rt.get("flow_smooth_sigma", 2.0))
 
         with self.lock:
             for idx in range(n_frames):
@@ -1582,7 +1625,6 @@ class StormArchiver:
                 fpath = os.path.join(ep_dir, fname)
                 replay_path = fpath.replace(".png", f".replay-{params_hash}.png")
 
-                # Save raw frame
                 if not os.path.exists(fpath):
                     try:
                         frames[idx].convert("P", palette=Image.ADAPTIVE, colors=64).save(
@@ -1594,10 +1636,11 @@ class StormArchiver:
                         print(f"archive: raw save error {e}", file=sys.stderr)
                         continue
 
-                # Save precomputed replay (only if raw exists and replay missing)
                 if precompute and not os.path.exists(replay_path):
                     try:
-                        flow = combined_flow(flows, idx, int(rt["flow_average_pairs"]))
+                        flow = combined_flow(flows, idx,
+                                             int(rt["flow_average_pairs"]),
+                                             smooth_sigma=smooth_sigma)
                         if flow is None:
                             flow = np.zeros((h, w, 2), dtype=np.float32)
                         png = replay_renderer(frames[idx], mask, mmh, flow,
@@ -1609,7 +1652,6 @@ class StormArchiver:
                     except Exception as e:
                         print(f"archive: replay precompute error {e}", file=sys.stderr)
 
-                # Update episode metadata
                 peak_mmh = float(mmh[local_precip].max()) if px_count > 0 else 0.0
                 mean_mmh = float(mmh[local_precip].mean()) if px_count > 0 else 0.0
                 self._update_episode_meta(
@@ -2009,6 +2051,12 @@ def _draw_text_outlined(draw, x, y, text, fill, outline):
     draw.text((x, y), text, fill=fill)
 
 
+def _draw_cross(draw, cx, cy, arm, color, width=2):
+    cx, cy = int(round(cx)), int(round(cy))
+    draw.line([(cx - arm, cy), (cx + arm, cy)], fill=color, width=width)
+    draw.line([(cx, cy - arm), (cx, cy + arm)], fill=color, width=width)
+
+
 def _draw_arrow(draw, x0, y0, x1, y1, color, outline=(0, 0, 0)):
     dx = x1 - x0
     dy = y1 - y0
@@ -2156,8 +2204,12 @@ def compose_map(radar_mask, radar_mmh, gray, calib, target_lat, target_lon,
     pil = Image.fromarray(rgb.astype(np.uint8))
     draw = ImageDraw.Draw(pil)
 
-    # Flow arrows for each cluster (aggregate motion for display)
+    # Arrows: gated by coherence. A cluster whose per-pixel flow disagrees
+    # (coherence < 0.4) is deforming — the median vector is not physically
+    # meaningful, so don't draw an arrow at all.
     for a in arrivals:
+        if a.coherence < 0.4:
+            continue
         if math.hypot(a.vx_kmh, a.vy_kmh) < MIN_SPEED_KMH:
             continue
         c = a.cluster
@@ -2169,15 +2221,16 @@ def compose_map(radar_mask, radar_mmh, gray, calib, target_lat, target_lon,
         lon_1h = clon + a.vx_kmh / (111.32 * coslat)
         px1, py1 = _latlon_to_overlay_px(calib, target_lat, target_lon,
                                          radius_km, size_px, view_rot, lat_1h, lon_1h)
-        if ((0 <= px0 < size_px and 0 <= py0 < size_px)
+        if not ((0 <= px0 < size_px and 0 <= py0 < size_px)
                 or (0 <= px1 < size_px and 0 <= py1 < size_px)):
-            if a.eta_min is not None and a.eta_min <= 30:
-                arrow_color = (245, 55, 55)
-            elif a.eta_min is not None:
-                arrow_color = (255, 175, 40)
-            else:
-                arrow_color = (110, 235, 255)
-            _draw_arrow(draw, px0, py0, px1, py1, arrow_color)
+            continue
+        if a.eta_min is not None and a.eta_min <= 30:
+            arrow_color = (245, 55, 55)
+        elif a.eta_min is not None:
+            arrow_color = (255, 175, 40)
+        else:
+            arrow_color = (110, 235, 255)
+        _draw_arrow(draw, px0, py0, px1, py1, arrow_color)
 
     if show_cities:
         for label, name, clat, clon in CITIES:
@@ -2191,6 +2244,53 @@ def compose_map(radar_mask, radar_mmh, gray, calib, target_lat, target_lon,
     _draw_scale_bar(pil, 14, size_px - 18, radius_km, size_px, view_rot)
     _draw_legend(pil, confirm_mm)
     return pil
+
+
+def render_raw_diagnostic(frame, calib, target_lat, target_lon, size_px=720):
+    """Raw DHMZ frame with calibration markers in DHMZ pixel space.
+
+    What you should see:
+      * Yellow circles + labels on anchor cities at their DHMZ pixel positions.
+      * Magenta crosshair for the target (Zadar or wherever configured). If
+        this lands on the correct geographic spot in the raw DHMZ image, the
+        calibration is good.
+      * 100-px reference grid.
+    """
+    pil = frame.convert("RGB").copy()
+    W, H = pil.size
+    if W != size_px or H != size_px:
+        scale_x = size_px / W
+        scale_y = size_px / H
+        pil = pil.resize((size_px, size_px), Image.LANCZOS)
+    else:
+        scale_x = scale_y = 1.0
+    draw = ImageDraw.Draw(pil)
+    for gx in range(0, size_px, 100):
+        draw.line([(gx, 0), (gx, size_px)], fill=(60, 60, 60), width=1)
+    for gy in range(0, size_px, 100):
+        draw.line([(0, gy), (size_px, gy)], fill=(60, 60, 60), width=1)
+    for label, lat, lon in calib.anchor_cities:
+        ix, iy = calib.latlon_to_image_pixel(lat, lon)
+        ix *= scale_x; iy *= scale_y
+        if 0 <= ix < size_px and 0 <= iy < size_px:
+            draw.ellipse([ix - 5, iy - 5, ix + 5, iy + 5],
+                         outline=(255, 255, 0), width=2)
+            _draw_text_outlined(draw, ix + 8, iy - 6, label,
+                                (255, 255, 0), (0, 0, 0))
+    ix_t, iy_t = calib.latlon_to_image_pixel(target_lat, target_lon)
+    ix_t *= scale_x; iy_t *= scale_y
+    if 0 <= ix_t < size_px and 0 <= iy_t < size_px:
+        _draw_cross(draw, ix_t, iy_t, 16, (255, 50, 255), width=2)
+        draw.ellipse([ix_t - 8, iy_t - 8, ix_t + 8, iy_t + 8],
+                     outline=(255, 50, 255), width=1)
+        _draw_text_outlined(draw, ix_t + 18, iy_t - 6,
+                            f"target ({target_lat:.3f},{target_lon:.3f})",
+                            (255, 50, 255), (0, 0, 0))
+    _draw_text_outlined(draw, 10, 8, "RAW DHMZ frame — fit check",
+                        (255, 220, 60), (0, 0, 0))
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 
 
 def render_composed_png(frame, calib, target_lat, target_lon, radius_km,
@@ -2221,13 +2321,15 @@ def render_composed_gif(frames, flows, calib, target_lat, target_lon, radius_km,
                         frame_duration_ms=400, max_frames=30):
     nf = len(frames)
     start = max(0, nf - max_frames)
+    smooth_sigma = float(rt.get("flow_smooth_sigma", 2.0))
     out = []
     for fidx in range(start, nf):
         frame = frames[fidx].convert("RGB")
         mask, mmh = analyze_frame(frame, calib.map_region, intensity_mode,
                                   sri_legend, legend_mask)
         gray = _radar_to_grayscale(mask, mmh)
-        flow = combined_flow(flows, fidx, int(rt["flow_average_pairs"]))
+        flow = combined_flow(flows, fidx, int(rt["flow_average_pairs"]),
+                             smooth_sigma=smooth_sigma)
         if flow is None:
             flow = np.zeros((*mask.shape, 2), dtype=np.float32)
         _, _, arrivals, _ = analyze_frame_state(mask, mmh, flow, calib,
@@ -3066,11 +3168,16 @@ def _replay_cache_put(key, data):
         while len(_REPLAY_CACHE) > _REPLAY_CACHE_MAX:
             _REPLAY_CACHE.popitem(last=False)
 
-
+         
 # ============================================================================
 # SECTION 23 — Web UI
+#   23.1  _INDEX_HTML       dashboard template
+#   23.2  _REPLAY_HTML      replay template
+#   23.3  _VizHandler       HTTP handler (routes + per-endpoint bodies)
+#   23.4  start_web         server bootstrap
 # ============================================================================
 
+# ---------------------------------------------------------------- 23.1 -----
 _INDEX_HTML = """<!DOCTYPE html><html><head><title>DHMZ Radar Nowcaster</title>
 <style>
 body{background:#111;color:#ddd;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:20px}
@@ -3105,7 +3212,7 @@ a{color:#5cf}.hint{color:#778;font-size:11px;margin-top:4px}
 .badge{background:#244866;color:#9df;padding:3px 8px;border-radius:3px;font-size:12px;text-decoration:none}
 </style></head><body>
 <h1>DHMZ Radar Nowcaster <a class="badge" href="/replay">Offline Replay →</a></h1>
-<p><a href="/threat.gif">/threat.gif</a> · <a href="/threat.png">/threat.png</a> · <a href="/status">/status</a> · <a href="/settings">/settings</a> · <a href="/config">/config</a> · <a href="/archive">/archive</a> · <a href="/accuracy">/accuracy</a></p>
+<p><a href="/threat.gif">/threat.gif</a> · <a href="/threat.png">/threat.png</a> · <a href="/threat-raw.png">/threat-raw.png</a> (fit check) · <a href="/status">/status</a> · <a href="/settings">/settings</a> · <a href="/config">/config</a> · <a href="/archive">/archive</a> · <a href="/accuracy">/accuracy</a></p>
 <div class="layout">
 <div class="left">
 <div class="status" id="status">Loading...</div>
@@ -3237,6 +3344,7 @@ setInterval(loadStatus,10000);setInterval(loadAccuracy,30000);setInterval(bumpIm
 </script></body></html>"""
 
 
+# ---------------------------------------------------------------- 23.2 -----
 _REPLAY_HTML = """<!DOCTYPE html><html><head><title>Offline Replay — DHMZ Radar</title>
 <style>
 body{background:#0e1014;color:#dde;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:18px}
@@ -3379,6 +3487,7 @@ loadEpisodes();
 </script></body></html>"""
 
 
+# ---------------------------------------------------------------- 23.3 -----
 class _VizHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -3398,6 +3507,8 @@ class _VizHandler(BaseHTTPRequestHandler):
             self._bytes("png", "image/png")
         elif path == "/threat.gif":
             self._bytes("gif", "image/gif")
+        elif path == "/threat-raw.png":
+            self._raw_diagnostic()
         elif path == "/status":
             self._status()
         elif path == "/settings":
@@ -3474,6 +3585,31 @@ class _VizHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache, max-age=0")
         self.end_headers(); self.wfile.write(data)
 
+    def _raw_diagnostic(self):
+        frame = _VIZ_STATE.get("raw_frame")
+        calib = _VIZ_STATE.get("calib")
+        if frame is None or calib is None:
+            self.send_response(503)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "9")
+            self.end_headers()
+            self.wfile.write(b"not ready")
+            return
+        target = _VIZ_STATE.get("target") or (0.0, 0.0)
+        try:
+            out = render_raw_diagnostic(
+                frame, calib, target[0], target[1],
+                size_px=(_static_snapshot().get("basemap_size") or 720))
+        except Exception as e:
+            print(f"raw diagnostic error: {e}", file=sys.stderr)
+            self.send_response(500); self.end_headers(); return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(out)))
+        self.send_header("Cache-Control", "no-cache, max-age=0")
+        self.end_headers()
+        self.wfile.write(out)
+
     def _status(self):
         with _VIZ_STATE["lock"]:
             status = dict(_VIZ_STATE["status"])
@@ -3538,7 +3674,8 @@ class _VizHandler(BaseHTTPRequestHandler):
             return
 
         flows = eng.get_flows(ep_id, data)
-        flow = combined_flow(flows, idx, int(rt["flow_average_pairs"]))
+        flow = combined_flow(flows, idx, int(rt["flow_average_pairs"]),
+                             smooth_sigma=float(rt.get("flow_smooth_sigma", 2.0)))
         if flow is None:
             m_shape = data[idx][1].shape
             flow = np.zeros((*m_shape, 2), dtype=np.float32)
@@ -3634,6 +3771,7 @@ class _VizHandler(BaseHTTPRequestHandler):
         pass
 
 
+# ---------------------------------------------------------------- 23.4 -----
 def start_web(port):
     srv = ThreadingHTTPServer(("0.0.0.0", port), _VizHandler)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -3643,8 +3781,14 @@ def start_web(port):
 
 # ============================================================================
 # SECTION 24 — CLI + main loop
+#   24.1  parse_sri_thresholds, parse_region
+#   24.2  build_arg_parser
+#   24.3  bootstrap_from_args  (config load, validation, static resolution)
+#   24.4  run_loop             (the while True cycle)
+#   24.5  main / entry point
 # ============================================================================
 
+# ---------------------------------------------------------------- 24.1 -----
 def parse_sri_thresholds(s):
     parts = [float(x) for x in s.split(",")]
     if len(parts) != 3:
@@ -3659,7 +3803,8 @@ def parse_region(s):
     return tuple(parts)
 
 
-def main():
+# ---------------------------------------------------------------- 24.2 -----
+def build_arg_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", default="/data")
     p.add_argument("--config", default=None)
@@ -3684,6 +3829,7 @@ def main():
     p.add_argument("--flow-block-px", type=int, dest="flow_block_px", default=None)
     p.add_argument("--flow-search-px", type=int, dest="flow_search_px", default=None)
     p.add_argument("--flow-average-pairs", type=int, dest="flow_average_pairs", default=None)
+    p.add_argument("--flow-smooth-sigma", type=float, dest="flow_smooth_sigma", default=None)
     p.add_argument("--radar-intensity", choices=("simple", "sri"), default=None)
     p.add_argument("--sri-legend-region", default=None)
     p.add_argument("--sri-legend-orientation", choices=("horizontal", "vertical"), default=None)
@@ -3739,13 +3885,16 @@ def main():
     p.add_argument("--once", action="store_true")
     p.add_argument("--list-cities", action="store_true")
     p.add_argument("--dump-sri-calibration", action="store_true")
-    args = p.parse_args()
+    return p
 
-    if args.list_cities:
-        for label, name, lat, lon in CITIES:
-            print(f"  {label:<4} {name:<18} ({lat:.4f}, {lon:.4f})")
-        return
 
+# ---------------------------------------------------------------- 24.3 -----
+def bootstrap_from_args(args):
+    """Load config, merge CLI overrides, resolve target, build shared objects.
+
+    Returns a dict with all state needed by run_loop(). Exits via argparse
+    error on invalid input.
+    """
     data_dir = args.data_dir or None
     cfg_path = args.config or (os.path.join(data_dir, "config.json") if data_dir else None)
     existing_cfg = _load_json_file(cfg_path)
@@ -3770,15 +3919,14 @@ def main():
     if st.get("location"):
         r = resolve_city(st["location"])
         if not r:
-            p.error(f"Unknown city '{st['location']}'")
+            raise SystemExit(f"Unknown city '{st['location']}'")
         target_name, target_lat, target_lon = r
     elif st.get("lat") is not None and st.get("lon") is not None:
         target_name = f"({st['lat']:.4f},{st['lon']:.4f})"
         target_lat, target_lon = st["lat"], st["lon"]
     else:
-        p.error("Provide --location or --lat/--lon (or set in config.json)")
+        raise SystemExit("Provide --location or --lat/--lon (or set in config.json)")
 
-    sri_thresholds = parse_sri_thresholds(st["sri_thresholds"])
     display_tz, display_tz_name = get_zoneinfo(st["display_tz"])
     ts_tz = display_tz if st["timestamp_tz"] is None else get_zoneinfo(st["timestamp_tz"])[0]
     ts_region = (None if not st["timestamp_enabled"] else parse_region(st["timestamp_region"]))
@@ -3789,9 +3937,9 @@ def main():
     legend_mask = None
     if st["radar_intensity"] == "sri":
         if not st["sri_legend_region"]:
-            p.error("--radar-intensity sri requires --sri-legend-region")
+            raise SystemExit("--radar-intensity sri requires --sri-legend-region")
         if not st["sri_breaks"]:
-            p.error("--radar-intensity sri requires --sri-breaks")
+            raise SystemExit("--radar-intensity sri requires --sri-breaks")
         breaks = [float(x) for x in st["sri_breaks"].split(",")]
         sri_legend = SRILegend(
             region=parse_region(st["sri_legend_region"]),
@@ -3827,6 +3975,42 @@ def main():
 
     pljusak = PljusakClient(url=st["pljusak_url"]) if st["pljusak_enabled"] else None
 
+    print(f"Target: {target_name} ({target_lat:.4f}N, {target_lon:.4f}E)")
+    print(f"Display timezone: {display_tz_name}")
+
+    return {
+        "data_dir": data_dir,
+        "target_name": target_name,
+        "target_lat": target_lat,
+        "target_lon": target_lon,
+        "display_tz": display_tz,
+        "ts_tz": ts_tz,
+        "ts_region": ts_region,
+        "static_ts_region": static_ts_region,
+        "sri_legend": sri_legend,
+        "legend_mask": legend_mask,
+        "acc_store": acc_store,
+        "mqtt_bridge": mqtt_bridge,
+        "pljusak": pljusak,
+    }
+
+
+# ---------------------------------------------------------------- 24.4 -----
+def run_loop(ctx, args):
+    data_dir = ctx["data_dir"]
+    target_name = ctx["target_name"]
+    target_lat = ctx["target_lat"]
+    target_lon = ctx["target_lon"]
+    display_tz = ctx["display_tz"]
+    ts_tz = ctx["ts_tz"]
+    ts_region = ctx["ts_region"]
+    static_ts_region = ctx["static_ts_region"]
+    sri_legend = ctx["sri_legend"]
+    legend_mask = ctx["legend_mask"]
+    acc_store = ctx["acc_store"]
+    mqtt_bridge = ctx["mqtt_bridge"]
+    pljusak = ctx["pljusak"]
+
     calib = None
     archiver = None
     replay_engine = None
@@ -3842,14 +4026,12 @@ def main():
     ocr_source = "init"
     current_rain_history = []
 
-    print(f"Target: {target_name} ({target_lat:.4f}N, {target_lon:.4f}E)")
-    print(f"Display timezone: {display_tz_name}")
-
     try:
         while True:
             t_start = time.monotonic()
             now_utc = datetime.now(timezone.utc)
             rt = _snapshot()
+            st = _static_snapshot()
 
             if pljusak:
                 if (pljusak.last_fetch_utc is None
@@ -3974,7 +4156,7 @@ def main():
             data_age = ((now_utc - last_frame_ts).total_seconds() / 60.0
                         if last_frame_ts else None)
 
-            # --- Analyze current frame ---
+            # --- Analyze all frames ---
             frames_list = [f for (_, f) in frame_buffer]
             times_list = [t for (t, _) in frame_buffer]
             masks_mmh = [analyze_frame(f, calib.map_region, st["radar_intensity"],
@@ -3995,7 +4177,9 @@ def main():
             focus_mask = calib.radius_mask(h_c, w_c, target_lat, target_lon,
                                            float(rt["focus_radius_km"]))
             focus_mask_c = current_mask & focus_mask
-            current_flow = combined_flow(flows, len(flows), int(rt["flow_average_pairs"]))
+            current_flow = combined_flow(
+                flows, len(flows), int(rt["flow_average_pairs"]),
+                smooth_sigma=float(rt.get("flow_smooth_sigma", 2.0)))
             if current_flow is None:
                 current_flow = np.zeros((h_c, w_c, 2), dtype=np.float32)
 
@@ -4003,7 +4187,7 @@ def main():
                 focus_mask_c, current_mmh, current_flow, calib,
                 target_lat, target_lon, rt, st)
 
-            # --- Rain history streak (for rain_duration_min) ---
+            # --- Rain history streak ---
             px, py = calib.latlon_to_image_pixel(target_lat, target_lon)
             xi, yi = int(round(px)), int(round(py))
             if 0 <= yi < h_c and 0 <= xi < w_c:
@@ -4177,7 +4361,8 @@ def main():
                 "summary": {"nowcast": nc.summary,
                             "clusters": [{"label": cluster_label(i), "size_px": a.cluster.size,
                                           "max_mmh": round(a.cluster.max_mmh, 1),
-                                          "eta_min": round(a.eta_min, 0) if a.eta_min is not None else None}
+                                          "eta_min": round(a.eta_min, 0) if a.eta_min is not None else None,
+                                          "coherence": round(a.coherence, 2)}
                                          for i, a in enumerate(arrivals)]},
                 "local_temp_c": {
                     "radius_km": local_wx.radius_km,
@@ -4208,6 +4393,9 @@ def main():
             with _VIZ_STATE["lock"]:
                 _VIZ_STATE["png"] = png_bytes
                 _VIZ_STATE["gif"] = gif_bytes
+                _VIZ_STATE["raw_frame"] = frames_list[-1]
+                _VIZ_STATE["calib"] = calib
+                _VIZ_STATE["target"] = (target_lat, target_lon)
                 _VIZ_STATE["updated"] = now_utc.astimezone(display_tz).strftime("%Y-%m-%d %H:%M:%S %Z")
                 _VIZ_STATE["status"] = {
                     "target": target_name,
@@ -4258,6 +4446,24 @@ def main():
     finally:
         if mqtt_bridge:
             mqtt_bridge.close()
+
+
+# ---------------------------------------------------------------- 24.5 -----
+def main():
+    p = build_arg_parser()
+    args = p.parse_args()
+
+    if args.list_cities:
+        for label, name, lat, lon in CITIES:
+            print(f"  {label:<4} {name:<18} ({lat:.4f}, {lon:.4f})")
+        return
+
+    ctx = bootstrap_from_args(args)
+    run_loop(ctx, args)
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
