@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-DHMZ radar + pljusak station tracker with satellite basemap & storm frame archiver.
+DHMZ radar + pljusak station tracker with satellite basemap, storm frame archiver,
+walk-forward speed/heading scoring, adaptive velocity windowing, and a dedicated
+Offline Replay & Shadow Auto-Tuner GUI (/replay).
 
 Endpoints:
-  /                    HTML dashboard
+  /                    Live HTML dashboard
+  /replay              Dedicated Offline Replay & Shadow Auto-Tuner GUI
   /threat.png          Current frame: satellite/radar composite + overlays
   /threat.gif          Animated composite
   /status              JSON: summary + local_weather + sensors + threats + archive
   /settings            GET/POST hot-swappable runtime settings
   /config              GET full JSON config (POST replace, DELETE reset)
   /archive             GET archived storm episodes & frame counts
+  /replay/run          POST run shadow vs baseline evaluation across episodes
+  /replay/frame        GET rendered PNG for an archived episode frame + shadow overlay
+  /replay/autotune     POST run 2-stage shadow auto-tuner and save new profile iteration
+  /profiles            GET/POST/DELETE saved parameter profiles (baseline + iterations)
+  /profiles/promote    POST promote a saved profile to active runtime config
   /refresh             POST force refresh
   /accuracy            GET stats, /accuracy/predictions, /accuracy/events
   /accuracy/reset      POST clear scores
   /accuracy/replay     POST re-score
-
-Config persists to <data-dir>/config.json. Default <data-dir> is /data.
-Basemap cache at <data-dir>/basemap_cache/.
-Storm frame archive at <data-dir>/archive/<YYYY-MM-DD_HHMMZ>/.
 """
 
 import argparse
@@ -25,6 +29,7 @@ import io
 import json
 import math
 import os
+import random
 import re
 import sys
 import threading
@@ -83,8 +88,6 @@ CLUSTER_DIGITS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
 
 DEFAULT_SRI_THRESHOLDS = (2.5, 10.0, 30.0)
 
-# Official DHMZ SRI (Surface Rainfall Intensity) color scale:
-# (min_mmh, max_mmh, (R, G, B), label)
 DHMZ_SRI_SCALE = [
     (0.2,   0.5,   (20,  50,  210), "0.2"),
     (0.5,   1.0,   (0,   110, 255), "0.5"),
@@ -116,7 +119,6 @@ COMPASS_16_DEG = {
     "W": 270.0, "WNW": 292.5, "NW": 315.0, "NNW": 337.5,
 }
 
-STALE_PRED_EXTRA_MIN = 30.0
 MATCH_TOLERANCE_FACTOR = 1.5
 MATCH_TOLERANCE_MIN = 60.0
 
@@ -190,6 +192,8 @@ _RUNTIME = {
     "threat_min_sri_mmh": 0.0,
     "min_duration_frames": 2,
     "min_size_px": 30,
+    "velocity_window_min": 25.0,
+    "velocity_adaptive": True,
     "radius_km": 150.0,
     "weather_radius_km": 5.0,
     "archive_enabled": True,
@@ -204,7 +208,7 @@ _RUNTIME = {
     "basemap_contrast": 1.0,
     "show_cities": True,
     "web_scale": 1.0,
-    "settings_tag": "",
+    "settings_tag": "baseline",
 }
 _RUNTIME_TYPES = {
     "approaching_radius_km": (float, 1.0, 500.0),
@@ -216,6 +220,8 @@ _RUNTIME_TYPES = {
     "threat_min_sri_mmh": (float, 0.0, 500.0),
     "min_duration_frames": (int, 1, 50),
     "min_size_px": (int, 5, 5000),
+    "velocity_window_min": (float, 10.0, 90.0),
+    "velocity_adaptive": (bool, None, None),
     "radius_km": (float, 20.0, 1000.0),
     "weather_radius_km": (float, 0.5, 100.0),
     "archive_enabled": (bool, None, None),
@@ -232,6 +238,20 @@ _RUNTIME_TYPES = {
     "web_scale": (float, 0.1, 4.0),
     "settings_tag": (str, None, None),
 }
+_TUNABLE_KEYS = (
+    "velocity_window_min",
+    "velocity_adaptive",
+    "min_size_px",
+    "min_duration_frames",
+    "approaching_radius_km",
+    "cluster_radius_weight",
+    "only_approach_deg",
+    "threat_radius_km",
+    "threat_angle_deg",
+    "threat_min_duration",
+    "threat_min_sri_mmh",
+)
+
 _RUNTIME_LOCK = threading.Lock()
 _FORCE_REFRESH = threading.Event()
 
@@ -298,6 +318,7 @@ _CLI_TO_RUNTIME = {
     "threat_min_sri": "threat_min_sri_mmh",
     "min_duration": "min_duration_frames",
     "min_size": "min_size_px",
+    "velocity_window": "velocity_window_min",
     "radius": "radius_km",
     "weather_radius": "weather_radius_km",
     "archive_radius": "archive_radius_km",
@@ -362,6 +383,7 @@ _CLI_TO_RUNTIME_BOOL = {
     "cities": "show_cities",
     "view_rotation_auto": "view_rotation_auto",
     "archive_enabled": "archive_enabled",
+    "velocity_adaptive": "velocity_adaptive",
 }
 
 _VIZ_STATE = {
@@ -750,6 +772,11 @@ def bearing_label(deg):
     return dirs[int((deg + 11.25) % 360 // 22.5)]
 
 
+def angular_diff_deg(a, b):
+    d = abs((a - b + 180.0) % 360.0 - 180.0)
+    return d
+
+
 @dataclass
 class MapRegion:
     x0: int
@@ -953,12 +980,6 @@ class SRILegend:
         self.samples_mmh = np.array(sample_mmh, dtype=np.float64)
         self.tree = cKDTree(self.samples_rgb)
         self._ready = True
-        for i in range(1, len(self.samples_rgb)):
-            d = float(np.linalg.norm(self.samples_rgb[i] - self.samples_rgb[i - 1]))
-            if d < 15:
-                print(f"WARNING: legend samples at breaks {i-1} and {i} "
-                      f"({self.breaks[i-1]:g} and {self.breaks[i]:g} mm/h) "
-                      f"nearly identical (RGB dist {d:.1f}).", file=sys.stderr)
 
     def is_ready(self):
         return self._ready
@@ -1022,16 +1043,6 @@ def analyze_frame(frame, map_region, intensity_mode, sri_legend, legend_mask):
 # Storm Frame Archiver (deduplicated PNGs grouped by storm episode)
 # ----------------------------------------------------------------------------
 class StormArchiver:
-    """
-    Archives individual deduplicated radar PNG frames whenever precipitation
-    occurs within `archive_radius_km` of the target location.
-
-    Each frame is timestamped by its exact radar frame UTC timestamp
-    (so overlapping 30-frame GIF polls never store duplicate frames, while
-    automatic historical backfill still captures the full 2.5h ramp-up of a storm).
-    Frames within 45 minutes of one another are grouped into an episode folder
-    named `<YYYY-MM-DD_HHMMZ>` alongside an `event.json` summary.
-    """
     EPISODE_GAP_MIN = 45.0
 
     def __init__(self, data_dir, calib, target_lat, target_lon, target_name):
@@ -1042,7 +1053,7 @@ class StormArchiver:
         self.target_lon = target_lon
         self.target_name = target_name
         self.lock = threading.Lock()
-        self._mask_cache = {}  # (h, w, round(radius_km, 1)) -> bool ndarray
+        self._mask_cache = {}
         self.total_frames_saved = 0
         self.total_episodes = 0
         self.last_episode_id = None
@@ -1091,7 +1102,6 @@ class StormArchiver:
             return None
 
     def _resolve_episode_dir(self, frame_ts_utc):
-        """Find an existing episode whose time range covers or borders `frame_ts_utc`."""
         best_ep = None
         best_gap = float("inf")
         for d in sorted(os.listdir(self.root_dir)):
@@ -1122,11 +1132,6 @@ class StormArchiver:
     def process_animation(self, img, frame_masks_mmh, last_frame_ts_utc,
                           eff_interval_min, fallback_now_utc, rt,
                           local_weather=None, target_raining=False):
-        """
-        Inspect all frames in the fetched GIF. Any frame with >= `archive_min_pixels`
-        of precipitation inside `archive_radius_km` is saved as a deduplicated
-        palette-optimized PNG inside its storm episode directory.
-        """
         if not self.root_dir or not rt.get("archive_enabled", True):
             return 0
 
@@ -1136,9 +1141,7 @@ class StormArchiver:
         if n_frames == 0:
             return 0
 
-        anchor_utc = last_frame_ts_utc or fallback_now_utc
-        # Round anchor to nearest minute for deterministic filenames when OCR is unavailable
-        anchor_utc = anchor_utc.replace(second=0, microsecond=0)
+        anchor_utc = (last_frame_ts_utc or fallback_now_utc).replace(second=0, microsecond=0)
 
         saved_this_cycle = 0
         with self.lock:
@@ -1234,6 +1237,24 @@ class StormArchiver:
             }
         _save_json_file(meta_path, meta)
 
+    def load_episode_frames(self, episode_id):
+        """Returns sorted list of (frame_ts_utc, filepath) for an episode."""
+        if not self.root_dir:
+            return []
+        safe_id = os.path.basename(episode_id)
+        ep_dir = os.path.join(self.root_dir, safe_id)
+        if not os.path.isdir(ep_dir):
+            return []
+        files = sorted(f for f in os.listdir(ep_dir) if f.endswith(".png"))
+        out = []
+        for fn in files:
+            try:
+                ts = datetime.strptime(fn, "%Y%m%d_%H%M%SZ.png").replace(tzinfo=timezone.utc)
+            except ValueError:
+                ts = None
+            out.append((ts, os.path.join(ep_dir, fn), fn))
+        return out
+
     def summary(self):
         with self.lock:
             return {
@@ -1246,7 +1267,7 @@ class StormArchiver:
                 "last_saved_utc": self.last_saved_utc,
             }
 
-    def list_episodes(self, limit=30):
+    def list_episodes(self, limit=50):
         if not self.root_dir or not os.path.isdir(self.root_dir):
             return []
         out = []
@@ -1259,16 +1280,18 @@ class StormArchiver:
             for d in dirs:
                 ep_dir = os.path.join(self.root_dir, d)
                 meta = _load_json_file(os.path.join(ep_dir, "event.json"))
+                files = sorted(f for f in os.listdir(ep_dir) if f.endswith(".png"))
                 if meta:
+                    meta["frame_count"] = len(files)
+                    meta["frames"] = files
                     out.append(meta)
                 else:
-                    n = sum(1 for f in os.listdir(ep_dir) if f.endswith(".png"))
-                    out.append({"episode_id": d, "frame_count": n})
+                    out.append({"episode_id": d, "frame_count": len(files), "frames": files})
         return out
 
 
 # ----------------------------------------------------------------------------
-# Clustering + tracking
+# Clustering + tracking with Adaptive Velocity Windowing
 # ----------------------------------------------------------------------------
 @dataclass
 class PixelCluster:
@@ -1318,15 +1341,56 @@ class Track:
     span_frames: int = 0
     prev_size: Optional[int] = None
     event: Optional[str] = None
+    eff_window_min: float = VELOCITY_WINDOW_MIN
 
     @property
     def speed_kmh(self):
         return math.hypot(self.vx_kmh, self.vy_kmh)
 
 
-def _select_recent_window(obs, frame_interval_min, split_frames=None):
+def _compute_adaptive_window_min(obs, base_window_min, frame_interval_min, adaptive=True):
+    """
+    Adapts the regression window between [10 min, base_window_min * 1.4] based on
+    step-to-step heading curvature and cell area growth/decay rate:
+    - Steady straight-line motion -> expands up to 1.4x base_window_min to suppress jitter.
+    - Turning or rapidly intensifying/decaying cells -> shrinks toward 10 min to prevent lag.
+    """
+    if not adaptive or len(obs) < 3:
+        return float(base_window_min)
+
+    tail = obs[-min(len(obs), 6):]
+    step_bearings = []
+    for (f0, c0), (f1, c1) in zip(tail, tail[1:]):
+        dx = c1.cx - c0.cx
+        dy = -(c1.cy - c0.cy)
+        if math.hypot(dx, dy) >= 0.75:
+            step_bearings.append(math.degrees(math.atan2(dx, dy)) % 360.0)
+
+    turn_rate = 0.0
+    if len(step_bearings) >= 2:
+        diffs = [angular_diff_deg(b1, b0)
+                 for b0, b1 in zip(step_bearings, step_bearings[1:])]
+        turn_rate = float(np.mean(diffs))  # deg per step
+
+    s0 = max(1.0, float(tail[0][1].size))
+    s1 = max(1.0, float(tail[-1][1].size))
+    n_steps = max(1, tail[-1][0] - tail[0][0])
+    growth_per_step = abs(math.log(s1 / s0)) / n_steps
+
+    # Turn > 20 deg/step or >25% size change/step pushes scale down toward 0.4
+    turn_factor = max(0.0, min(1.0, 1.0 - (turn_rate / 25.0)))
+    growth_factor = max(0.0, min(1.0, 1.0 - (growth_per_step / 0.35)))
+    stability = 0.65 * turn_factor + 0.35 * growth_factor  # 0 (volatile) .. 1 (steady)
+
+    min_win = max(10.0, 2.0 * frame_interval_min)
+    max_win = max(base_window_min, min(60.0, base_window_min * 1.35))
+    return min_win + stability * (max_win - min_win)
+
+
+def _select_recent_window(obs, frame_interval_min, split_frames=None,
+                          base_window_min=VELOCITY_WINDOW_MIN, adaptive=True):
     if len(obs) <= 1:
-        return obs
+        return obs, float(base_window_min)
     if split_frames:
         last_fidx = obs[-1][0]
         latest_split = max((sf for sf in split_frames if sf <= last_fidx), default=None)
@@ -1335,23 +1399,30 @@ def _select_recent_window(obs, frame_interval_min, split_frames=None):
             if len(post_split) >= 2:
                 obs = post_split
 
+    eff_win = _compute_adaptive_window_min(
+        obs, base_window_min, frame_interval_min, adaptive=adaptive)
     last_fidx = obs[-1][0]
-    max_frame_span = max(1, int(round(VELOCITY_WINDOW_MIN / max(1.0, frame_interval_min))))
+    max_frame_span = max(1, int(round(eff_win / max(1.0, frame_interval_min))))
     cutoff_fidx = last_fidx - max_frame_span
     window = [o for o in obs if o[0] >= cutoff_fidx]
     if len(window) < 2:
         window = obs[-2:]
-    return window
+    return window, eff_win
 
 
-def _estimate_pixel_velocity(obs, frame_interval_min, split_frames=None):
-    window = _select_recent_window(obs, frame_interval_min, split_frames)
+def _estimate_pixel_velocity(obs, frame_interval_min, split_frames=None,
+                             base_window_min=VELOCITY_WINDOW_MIN, adaptive=True):
+    window, _ = _select_recent_window(
+        obs, frame_interval_min, split_frames, base_window_min, adaptive)
     if len(window) < 2:
         return 0.0, 0.0
     ts = np.array([o[0] for o in window], dtype=np.float64)
     xs = np.array([o[1].cx for o in window], dtype=np.float64)
     ys = np.array([o[1].cy for o in window], dtype=np.float64)
-    ws = np.sqrt(np.maximum(1.0, np.array([o[1].size for o in window], dtype=np.float64)))
+    # Recency * sqrt(size) weighting so recent frames carry slightly higher weight
+    age_steps = ts[-1] - ts
+    recency_w = np.exp(-0.12 * age_steps)
+    ws = recency_w * np.sqrt(np.maximum(1.0, np.array([o[1].size for o in window], dtype=np.float64)))
     w_sum = float(np.sum(ws))
     t_mean = float(np.sum(ws * ts) / w_sum)
     dt = ts - t_mean
@@ -1365,10 +1436,13 @@ def _estimate_pixel_velocity(obs, frame_interval_min, split_frames=None):
     return vx_px, vy_px
 
 
-def _estimate_velocity_kmh(obs, calib, frame_interval_min, split_frames=None):
-    window = _select_recent_window(obs, frame_interval_min, split_frames)
+def _estimate_velocity_kmh(obs, calib, frame_interval_min, split_frames=None,
+                           base_window_min=VELOCITY_WINDOW_MIN, adaptive=True,
+                           return_window=False):
+    window, eff_win = _select_recent_window(
+        obs, frame_interval_min, split_frames, base_window_min, adaptive)
     if len(window) < 2:
-        return 0.0, 0.0
+        return (0.0, 0.0, eff_win) if return_window else (0.0, 0.0)
 
     lat0, lon0 = calib.image_pixel_to_latlon(window[0][1].cx, window[0][1].cy)
     coslat = max(0.01, math.cos(math.radians(lat0)))
@@ -1378,19 +1452,21 @@ def _estimate_velocity_kmh(obs, calib, frame_interval_min, split_frames=None):
     ys_km = np.empty(len(window), dtype=np.float64)
     ws = np.empty(len(window), dtype=np.float64)
 
+    last_fidx = window[-1][0]
     for idx, (fidx, c) in enumerate(window):
         lat, lon = calib.image_pixel_to_latlon(c.cx, c.cy)
         ts_h[idx] = fidx * frame_interval_min / 60.0
         xs_km[idx] = (lon - lon0) * 111.32 * coslat
         ys_km[idx] = (lat - lat0) * 111.32
-        ws[idx] = math.sqrt(max(1.0, float(c.size)))
+        recency = math.exp(-0.12 * (last_fidx - fidx))
+        ws[idx] = recency * math.sqrt(max(1.0, float(c.size)))
 
     w_sum = float(np.sum(ws))
     t_mean = float(np.sum(ws * ts_h) / w_sum)
     dt = ts_h - t_mean
     denom = float(np.sum(ws * dt * dt))
     if denom <= 1e-9:
-        return 0.0, 0.0
+        return (0.0, 0.0, eff_win) if return_window else (0.0, 0.0)
 
     x_mean = float(np.sum(ws * xs_km) / w_sum)
     y_mean = float(np.sum(ws * ys_km) / w_sum)
@@ -1402,18 +1478,25 @@ def _estimate_velocity_kmh(obs, calib, frame_interval_min, split_frames=None):
         scale = MAX_STORM_SPEED_KMH / speed
         vx *= scale
         vy *= scale
-    return vx, vy
+    return (vx, vy, eff_win) if return_window else (vx, vy)
 
 
-def track_animation(img, calib, frame_interval_min, target_lat, target_lon,
-                    intensity_mode, sri_legend, legend_mask):
+def track_frame_sequence(frame_masks_mmh, calib, frame_interval_min,
+                         target_lat, target_lon, rt=None):
+    """
+    Core tracker over an arbitrary sequence of (mask, mmh) frames.
+    Used identically by live polling and offline replay / walk-forward scoring.
+    """
+    rt = rt or _snapshot()
+    base_win = float(rt.get("velocity_window_min", VELOCITY_WINDOW_MIN))
+    adaptive_win = bool(rt.get("velocity_adaptive", True))
+
     tracks_by_id = {}
     split_frames_by_id = {}
     next_id = 0
     prev_clusters, prev_ids = [], []
     n_frames = 0
     rain_history = []
-    frame_masks_mmh = []
     last_label_array = None
     last_mask = last_mmh = None
     last_frame_events = {}
@@ -1428,11 +1511,8 @@ def track_animation(img, calib, frame_interval_min, target_lat, target_lon,
     px, py = calib.latlon_to_image_pixel(target_lat, target_lon)
     xi, yi = int(round(px)), int(round(py))
 
-    for i, frame in enumerate(ImageSequence.Iterator(img)):
+    for i, (mask, mmh) in enumerate(frame_masks_mmh):
         n_frames += 1
-        mask, mmh = analyze_frame(frame, calib.map_region, intensity_mode,
-                                  sri_legend, legend_mask)
-        frame_masks_mmh.append((mask, mmh))
         last_mask, last_mmh = mask, mmh
         h, w = mask.shape
         if 0 <= yi < h and 0 <= xi < w:
@@ -1453,7 +1533,8 @@ def track_animation(img, calib, frame_interval_min, target_lat, target_lon,
             dt_f = max(1, i - obs[-1][0])
             if len(obs) >= 2:
                 vx_px, vy_px = _estimate_pixel_velocity(
-                    obs, frame_interval_min, split_frames_by_id.get(pid))
+                    obs, frame_interval_min, split_frames_by_id.get(pid),
+                    base_win, adaptive_win)
                 pred_x = p.cx + vx_px * dt_f
                 pred_y = p.cy + vy_px * dt_f
                 allowed_px = base_max_jump_px * dt_f
@@ -1536,17 +1617,480 @@ def track_animation(img, calib, frame_interval_min, target_lat, target_lon,
         tid = prev_ids[j]
         obs = tracks_by_id[tid]
         dt_frames = obs[-1][0] - obs[0][0]
-        tr = Track(cluster=c, cid=tid, n_observations=len(obs), span_frames=dt_frames)
+        tr = Track(cluster=c, cid=tid, n_observations=len(obs), span_frames=dt_frames,
+                   eff_window_min=base_win)
         if dt_frames > 0:
-            tr.vx_kmh, tr.vy_kmh = _estimate_velocity_kmh(
-                obs, calib, frame_interval_min, split_frames_by_id.get(tid))
+            tr.vx_kmh, tr.vy_kmh, tr.eff_window_min = _estimate_velocity_kmh(
+                obs, calib, frame_interval_min, split_frames_by_id.get(tid),
+                base_win, adaptive_win, return_window=True)
         if len(obs) >= 2:
             tr.prev_size = obs[-2][1].size
         tr.event = last_frame_events.get(tid)
         tracks.append(tr)
     return (last_mask, last_mmh, tracks, n_frames, rain_history,
             last_label_array, tracks_by_id, split_frames_by_id,
-            cluster_first_target_hit, frame_masks_mmh)
+            cluster_first_target_hit)
+
+
+def track_animation(img, calib, frame_interval_min, target_lat, target_lon,
+                    intensity_mode, sri_legend, legend_mask, rt=None):
+    frame_masks_mmh = []
+    for frame in ImageSequence.Iterator(img):
+        mask, mmh = analyze_frame(frame, calib.map_region, intensity_mode,
+                                  sri_legend, legend_mask)
+        frame_masks_mmh.append((mask, mmh))
+    res = track_frame_sequence(frame_masks_mmh, calib, frame_interval_min,
+                               target_lat, target_lon, rt=rt)
+    return (*res, frame_masks_mmh)
+
+
+# ----------------------------------------------------------------------------
+# Walk-Forward Speed & Heading Evaluator + Two-Stage Shadow Auto-Tuner
+# ----------------------------------------------------------------------------
+def evaluate_walk_forward_episode(frame_masks_mmh, calib, frame_interval_min,
+                                  target_lat, target_lon, rt, horizon_min=30.0):
+    """
+    Walk-forward evaluation across an archived storm episode:
+    1) Kinematics (no leakage): at frame t, fit (vx, vy) using ONLY obs <= t,
+       then measure predicted speed, heading, and future position miss against
+       actual observed positions at t + horizon_min.
+    2) Alert geometry: evaluate target hit Precision, Recall, F1, and ETA MAE
+       when radar rain actually reaches the target pixel.
+    """
+    (last_mask, last_mmh, _, n_frames, rain_history,
+     _, tracks_by_id, split_frames_by_id, _) = track_frame_sequence(
+        frame_masks_mmh, calib, frame_interval_min, target_lat, target_lon, rt=rt)
+
+    if n_frames < 3:
+        return None
+
+    base_win = float(rt.get("velocity_window_min", VELOCITY_WINDOW_MIN))
+    adaptive_win = bool(rt.get("velocity_adaptive", True))
+    min_size = int(rt.get("min_size_px", 30))
+    min_dur = int(rt.get("min_duration_frames", 2))
+    horizon_steps = max(1, int(round(horizon_min / max(1.0, frame_interval_min))))
+
+    speed_errs = []
+    heading_errs = []
+    pos_miss_km = []
+    eff_windows = []
+
+    for cid, obs in tracks_by_id.items():
+        if len(obs) <= horizon_steps + 1:
+            continue
+        obs_by_f = {fidx: c for fidx, c in obs}
+        for idx in range(1, len(obs) - horizon_steps):
+            f_now, c_now = obs[idx]
+            if c_now.size < min_size:
+                continue
+            obs_prefix = obs[:idx + 1]
+            if len(obs_prefix) < min_dur:
+                continue
+            f_fut = f_now + horizon_steps
+            c_fut = obs_by_f.get(f_fut)
+            if c_fut is None:
+                continue
+
+            vx_p, vy_p, eff_w = _estimate_velocity_kmh(
+                obs_prefix, calib, frame_interval_min,
+                split_frames_by_id.get(cid), base_win, adaptive_win,
+                return_window=True)
+            pred_speed = math.hypot(vx_p, vy_p)
+            if pred_speed < MIN_SPEED_KMH:
+                continue
+
+            lat0, lon0 = calib.image_pixel_to_latlon(c_now.cx, c_now.cy)
+            lat1, lon1 = calib.image_pixel_to_latlon(c_fut.cx, c_fut.cy)
+            dt_h = (f_fut - f_now) * frame_interval_min / 60.0
+            if dt_h <= 0:
+                continue
+
+            coslat = max(0.01, math.cos(math.radians((lat0 + lat1) / 2.0)))
+            act_dx = (lon1 - lon0) * 111.32 * coslat
+            act_dy = (lat1 - lat0) * 111.32
+            act_dist = math.hypot(act_dx, act_dy)
+            act_speed = act_dist / dt_h
+            if act_speed < MIN_SPEED_KMH:
+                continue
+
+            pred_dx = vx_p * dt_h
+            pred_dy = vy_p * dt_h
+            miss = math.hypot(pred_dx - act_dx, pred_dy - act_dy)
+
+            pred_brg = math.degrees(math.atan2(vx_p, vy_p)) % 360.0
+            act_brg = math.degrees(math.atan2(act_dx, act_dy)) % 360.0
+            hdg_err = angular_diff_deg(pred_brg, act_brg)
+
+            speed_errs.append(abs(pred_speed - act_speed))
+            heading_errs.append(hdg_err)
+            pos_miss_km.append(miss)
+            eff_windows.append(eff_w)
+
+    # Alert precision / recall / ETA error across frames
+    tp = fp = fn = 0
+    eta_errs = []
+    lookahead_steps = max(2, int(round(60.0 / max(1.0, frame_interval_min))))
+    for t in range(1, n_frames - 1):
+        # Did rain actually hit target within next 60 min?
+        future_rain = rain_history[t + 1:min(n_frames, t + 1 + lookahead_steps)]
+        actual_hit = any(future_rain)
+        actual_eta = None
+        if actual_hit:
+            first_idx = next(k for k, r in enumerate(future_rain) if r)
+            actual_eta = (first_idx + 1) * frame_interval_min
+
+        # Evaluate candidate alert at frame t using tracks up to t
+        active_tracks = []
+        for cid, obs in tracks_by_id.items():
+            pref = [o for o in obs if o[0] <= t]
+            if not pref or pref[-1][0] != t:
+                continue
+            c_here = pref[-1][1]
+            if c_here.size < min_size or len(pref) < min_dur:
+                continue
+            vx, vy = _estimate_velocity_kmh(
+                pref, calib, frame_interval_min,
+                split_frames_by_id.get(cid), base_win, adaptive_win)
+            tr = Track(cluster=c_here, cid=cid, vx_kmh=vx, vy_kmh=vy,
+                       n_observations=len(pref),
+                       span_frames=pref[-1][0] - pref[0][0])
+            active_tracks.append(tr)
+
+        approaches = [assess(tr, target_lat, target_lon, calib) for tr in active_tracks]
+        threats = [refine_threat(tr, a, rt) for tr, a in zip(active_tracks, approaches)]
+        pred_hit = any(threats)
+
+        if pred_hit and actual_hit:
+            tp += 1
+            etas = [a.eta_min for a, tf in zip(approaches, threats)
+                    if tf and a.eta_min is not None]
+            if etas and actual_eta is not None:
+                eta_errs.append(abs(min(etas) - actual_eta))
+        elif pred_hit and not actual_hit:
+            fp += 1
+        elif (not pred_hit) and actual_hit and not rain_history[t]:
+            fn += 1
+
+    return {
+        "n_frames": n_frames,
+        "kinematic_samples": len(pos_miss_km),
+        "speed_mae_kmh": round(float(np.mean(speed_errs)), 2) if speed_errs else None,
+        "heading_mae_deg": round(float(np.mean(heading_errs)), 1) if heading_errs else None,
+        "pos_miss_30m_km": round(float(np.mean(pos_miss_km)), 2) if pos_miss_km else None,
+        "avg_eff_window_min": round(float(np.mean(eff_windows)), 1) if eff_windows else None,
+        "tp": tp, "fp": fp, "fn": fn,
+        "eta_mae_min": round(float(np.mean(eta_errs)), 1) if eta_errs else None,
+    }
+
+
+def aggregate_walk_forward(ep_results):
+    valid = [r for r in ep_results if r is not None]
+    if not valid:
+        return {
+            "episodes_evaluated": 0,
+            "kinematic_samples": 0,
+            "speed_mae_kmh": None,
+            "heading_mae_deg": None,
+            "pos_miss_30m_km": None,
+            "avg_eff_window_min": None,
+            "precision": None,
+            "recall": None,
+            "f1": None,
+            "eta_mae_min": None,
+            "composite_score": None,
+        }
+
+    def _wmean(key):
+        vals = [(r[key], max(1, r["kinematic_samples"]))
+                for r in valid if r.get(key) is not None]
+        if not vals:
+            return None
+        num = sum(v * w for v, w in vals)
+        den = sum(w for _, w in vals)
+        return round(num / den, 2)
+
+    tp = sum(r["tp"] for r in valid)
+    fp = sum(r["fp"] for r in valid)
+    fn = sum(r["fn"] for r in valid)
+    prec = tp / (tp + fp) if (tp + fp) > 0 else None
+    rec = tp / (tp + fn) if (tp + fn) > 0 else None
+    f1 = (2 * prec * rec / (prec + rec)) if (prec and rec and (prec + rec) > 0) else 0.0
+
+    spd_mae = _wmean("speed_mae_kmh")
+    hdg_mae = _wmean("heading_mae_deg")
+    miss_30 = _wmean("pos_miss_30m_km")
+    eta_mae = _wmean("eta_mae_min")
+
+    # Lower composite loss = better overall accuracy (combines 30m track miss, heading, and alert F1)
+    loss = 0.0
+    if miss_30 is not None:
+        loss += miss_30 * 2.0
+    if hdg_mae is not None:
+        loss += hdg_mae * 0.25
+    if spd_mae is not None:
+        loss += spd_mae * 0.4
+    if eta_mae is not None:
+        loss += eta_mae * 0.3
+    loss += (1.0 - f1) * 15.0
+
+    return {
+        "episodes_evaluated": len(valid),
+        "kinematic_samples": sum(r["kinematic_samples"] for r in valid),
+        "speed_mae_kmh": spd_mae,
+        "heading_mae_deg": hdg_mae,
+        "pos_miss_30m_km": miss_30,
+        "avg_eff_window_min": _wmean("avg_eff_window_min"),
+        "precision": round(prec, 3) if prec is not None else None,
+        "recall": round(rec, 3) if rec is not None else None,
+        "f1": round(f1, 3),
+        "eta_mae_min": eta_mae,
+        "composite_loss": round(loss, 2),
+    }
+
+
+class ProfileStore:
+    """
+    Persists versioned parameter profiles (`baseline` + every shadow tuner iteration)
+    in `<data-dir>/profiles.json` so baseline and previous iterations are never lost.
+    """
+    def __init__(self, data_dir):
+        self.path = os.path.join(data_dir, "profiles.json") if data_dir else None
+        self.lock = threading.Lock()
+        self.profiles = {}
+        if self.path:
+            self._load()
+
+    def _load(self):
+        raw = _load_json_file(self.path)
+        if isinstance(raw, dict) and "profiles" in raw:
+            self.profiles = raw["profiles"]
+
+    def _save(self):
+        if self.path:
+            _save_json_file(self.path, {"version": 1, "profiles": self.profiles})
+
+    def ensure_baseline(self, current_rt):
+        with self.lock:
+            if "baseline" not in self.profiles:
+                self.profiles["baseline"] = {
+                    "name": "baseline",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "parent": None,
+                    "stage": "initial",
+                    "params": {k: current_rt[k] for k in _TUNABLE_KEYS if k in current_rt},
+                    "metrics": None,
+                }
+                self._save()
+
+    def save_profile(self, name, params, metrics=None, parent="baseline", stage="manual"):
+        with self.lock:
+            clean_params = {k: params[k] for k in _TUNABLE_KEYS if k in params}
+            self.profiles[name] = {
+                "name": name,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "parent": parent,
+                "stage": stage,
+                "params": clean_params,
+                "metrics": metrics,
+            }
+            self._save()
+            return self.profiles[name]
+
+    def next_iter_name(self):
+        with self.lock:
+            n = 1
+            while f"iter-{n:02d}" in self.profiles:
+                n += 1
+            return f"iter-{n:02d}"
+
+    def get(self, name):
+        with self.lock:
+            return dict(self.profiles[name]) if name in self.profiles else None
+
+    def list_all(self):
+        with self.lock:
+            return list(self.profiles.values())
+
+    def delete(self, name):
+        if name == "baseline":
+            return False
+        with self.lock:
+            if name in self.profiles:
+                del self.profiles[name]
+                self._save()
+                return True
+            return False
+
+
+class OfflineReplayEngine:
+    """Caches decoded archived episodes in RAM and runs walk-forward / 2-stage shadow tuning."""
+    def __init__(self, archiver, calib, target_lat, target_lon,
+                 frame_interval_min, intensity_mode, sri_legend):
+        self.archiver = archiver
+        self.calib = calib
+        self.target_lat = target_lat
+        self.target_lon = target_lon
+        self.frame_interval_min = frame_interval_min
+        self.intensity_mode = intensity_mode
+        self.sri_legend = sri_legend
+        self._cache = {}  # episode_id -> (frame_count, [(ts, mask, mmh, fpath), ...])
+        self.lock = threading.Lock()
+
+    def get_episode_data(self, episode_id):
+        if not self.archiver:
+            return []
+        entries = self.archiver.load_episode_frames(episode_id)
+        if not entries:
+            return []
+        with self.lock:
+            cached = self._cache.get(episode_id)
+            if cached and cached[0] == len(entries):
+                return cached[1]
+
+        decoded = []
+        for ts, fpath, fname in entries:
+            try:
+                with Image.open(fpath) as im:
+                    mask, mmh = analyze_frame(
+                        im, self.calib.map_region, self.intensity_mode,
+                        self.sri_legend, None)
+                decoded.append((ts, mask, mmh, fpath, fname))
+            except Exception as e:
+                print(f"replay: error decoding {fpath}: {e}", file=sys.stderr)
+
+        with self.lock:
+            if len(self._cache) > 12:
+                self._cache.clear()
+            self._cache[episode_id] = (len(entries), decoded)
+        return decoded
+
+    def evaluate_params(self, params, episode_ids=None):
+        if not self.archiver:
+            return {"error": "archiver disabled"}
+        if not episode_ids:
+            eps = self.archiver.list_episodes(limit=15)
+            episode_ids = [e["episode_id"] for e in eps if e.get("frame_count", 0) >= 4]
+
+        full_rt = _snapshot()
+        full_rt.update({k: params[k] for k in _TUNABLE_KEYS if k in params})
+
+        per_ep = {}
+        results = []
+        for ep_id in episode_ids:
+            data = self.get_episode_data(ep_id)
+            if len(data) < 4:
+                continue
+            masks_mmh = [(d[1], d[2]) for d in data]
+            res = evaluate_walk_forward_episode(
+                masks_mmh, self.calib, self.frame_interval_min,
+                self.target_lat, self.target_lon, full_rt)
+            if res:
+                per_ep[ep_id] = res
+                results.append(res)
+
+        agg = aggregate_walk_forward(results)
+        agg["per_episode"] = per_ep
+        return agg
+
+    def run_two_stage_autotune(self, base_params, episode_ids=None,
+                               stage1_trials=14, stage2_trials=14):
+        """
+        Two-stage shadow tuner:
+          Stage 1: Random/Latin exploration of kinematic window & cell filtering
+                   (velocity_window_min, velocity_adaptive, min_size_px, min_duration_frames)
+                   minimizing 30-min track position miss + heading & speed MAE.
+          Stage 2: Coordinate/random refinement of approach & threat cone geometry
+                   (approaching_radius_km, cluster_radius_weight, threat_radius_km,
+                    threat_angle_deg, threat_min_sri_mmh) maximizing alert F1 & ETA accuracy.
+        """
+        if not episode_ids and self.archiver:
+            eps = self.archiver.list_episodes(limit=12)
+            episode_ids = [e["episode_id"] for e in eps if e.get("frame_count", 0) >= 4]
+        if not episode_ids:
+            return {"ok": False, "error": "No archived episodes with >=4 frames available yet."}
+
+        # Pre-decode episodes once so all trials run fast in memory
+        decoded_eps = []
+        for ep_id in episode_ids:
+            d = self.get_episode_data(ep_id)
+            if len(d) >= 4:
+                decoded_eps.append((ep_id, [(x[1], x[2]) for x in d]))
+        if not decoded_eps:
+            return {"ok": False, "error": "No valid archived frames found."}
+
+        def _eval_fast(cand_rt):
+            res_list = [
+                evaluate_walk_forward_episode(
+                    m_list, self.calib, self.frame_interval_min,
+                    self.target_lat, self.target_lon, cand_rt)
+                for _, m_list in decoded_eps
+            ]
+            return aggregate_walk_forward(res_list)
+
+        base_rt = _snapshot()
+        base_rt.update({k: base_params[k] for k in _TUNABLE_KEYS if k in base_params})
+        baseline_metrics = _eval_fast(base_rt)
+
+        # --- Stage 1: Kinematics ---
+        best_s1 = dict(base_rt)
+        best_s1_metrics = baseline_metrics
+
+        def _kinematic_loss(m):
+            if m["kinematic_samples"] == 0:
+                return 1e9
+            return ((m["pos_miss_30m_km"] or 25.0) * 2.0
+                    + (m["heading_mae_deg"] or 45.0) * 0.25
+                    + (m["speed_mae_kmh"] or 15.0) * 0.4)
+
+        best_s1_loss = _kinematic_loss(best_s1_metrics)
+        rng = random.Random(42)
+
+        for t in range(stage1_trials):
+            cand = dict(base_rt)
+            cand["velocity_window_min"] = round(rng.choice([15.0, 20.0, 25.0, 30.0, 35.0, 45.0]), 1)
+            cand["velocity_adaptive"] = rng.choice([True, True, False])
+            cand["min_size_px"] = rng.choice([20, 25, 30, 40, 50, 65])
+            cand["min_duration_frames"] = rng.choice([2, 3, 4])
+            m = _eval_fast(cand)
+            loss = _kinematic_loss(m)
+            if loss < best_s1_loss:
+                best_s1_loss = loss
+                best_s1 = cand
+                best_s1_metrics = m
+
+        # --- Stage 2: Alert Geometry & Threat Thresholds ---
+        best_s2 = dict(best_s1)
+        best_s2_metrics = best_s1_metrics
+        best_s2_loss = best_s2_metrics.get("composite_loss") or 1e9
+
+        for t in range(stage2_trials):
+            cand = dict(best_s1)
+            cand["approaching_radius_km"] = round(
+                max(8.0, min(60.0, best_s1["approaching_radius_km"] + rng.choice([-8.0, -4.0, 0.0, 4.0, 8.0, 12.0]))), 1)
+            cand["cluster_radius_weight"] = round(
+                max(0.2, min(2.0, best_s1["cluster_radius_weight"] + rng.choice([-0.3, -0.15, 0.0, 0.15, 0.3]))), 2)
+            cand["threat_radius_km"] = round(
+                max(5.0, min(45.0, best_s1["threat_radius_km"] + rng.choice([-5.0, -2.5, 0.0, 2.5, 5.0, 8.0]))), 1)
+            cand["threat_angle_deg"] = round(
+                max(15.0, min(90.0, best_s1["threat_angle_deg"] + rng.choice([-15.0, -7.5, 0.0, 7.5, 15.0]))), 1)
+            cand["threat_min_sri_mmh"] = round(
+                rng.choice([0.0, 0.5, 1.0, 2.0, 3.0]), 1)
+            m = _eval_fast(cand)
+            loss = m.get("composite_loss") or 1e9
+            if loss < best_s2_loss:
+                best_s2_loss = loss
+                best_s2 = cand
+                best_s2_metrics = m
+
+        full_final = self.evaluate_params(best_s2, episode_ids=episode_ids)
+        return {
+            "ok": True,
+            "episodes_used": episode_ids,
+            "baseline_metrics": baseline_metrics,
+            "stage1_metrics": best_s1_metrics,
+            "tuned_metrics": full_final,
+            "tuned_params": {k: best_s2[k] for k in _TUNABLE_KEYS},
+        }
 
 
 # ----------------------------------------------------------------------------
@@ -2517,7 +3061,7 @@ def compose_map(radar_mask, radar_mmh, gray, calib, target_lat, target_lon,
                 radius_km, view_rot, size_px, basemap_img, basemap_kind,
                 tracks, approaches, approaching_flags, threat_flags,
                 stations, show_cities, intensity_mode, sri_thresholds, rt,
-                confirm_mm=0.2):
+                confirm_mm=0.2, shadow_tracks=None):
     gray_out, mask_out, mmh_out = _sample_radar_at_view(
         gray, radar_mask, radar_mmh, calib, target_lat, target_lon,
         radius_km, view_rot, size_px, size_px)
@@ -2548,6 +3092,11 @@ def compose_map(radar_mask, radar_mmh, gray, calib, target_lat, target_lon,
         _draw_coast_overlay(rgb, calib, target_lat, target_lon,
                             radius_km, view_rot, size_px)
 
+    # Target marker crosshair
+    tpx, tpy = _latlon_to_overlay_px(calib, target_lat, target_lon,
+                                     radius_km, size_px, view_rot, target_lat, target_lon)
+    _draw_circle_outline(rgb, tpx, tpy, 6, (255, 255, 255), thickness=1)
+
     for st in stations:
         px, py = _latlon_to_overlay_px(calib, target_lat, target_lon,
                                        radius_km, size_px, view_rot,
@@ -2576,6 +3125,23 @@ def compose_map(radar_mask, radar_mmh, gray, calib, target_lat, target_lon,
 
     pil = Image.fromarray(rgb.astype(np.uint8))
     draw = ImageDraw.Draw(pil)
+
+    # Optional shadow vectors (magenta) drawn underneath baseline vectors for comparison
+    if shadow_tracks:
+        for strk in shadow_tracks:
+            if strk.speed_kmh < MIN_SPEED_KMH:
+                continue
+            clat, clon = calib.image_pixel_to_latlon(strk.cluster.cx, strk.cluster.cy)
+            px0, py0 = _latlon_to_overlay_px(calib, target_lat, target_lon,
+                                             radius_km, size_px, view_rot, clat, clon)
+            coslat = max(0.01, math.cos(math.radians(clat)))
+            lat_1h = clat + strk.vy_kmh / 111.32
+            lon_1h = clon + strk.vx_kmh / (111.32 * coslat)
+            px1, py1 = _latlon_to_overlay_px(calib, target_lat, target_lon,
+                                             radius_km, size_px, view_rot, lat_1h, lon_1h)
+            if ((0 <= px0 < size_px and 0 <= py0 < size_px)
+                    or (0 <= px1 < size_px and 0 <= py1 < size_px)):
+                _draw_arrow(draw, px0, py0, px1, py1, (220, 90, 255))
 
     for i, (tr, a, af, tf) in enumerate(zip(tracks, approaches, approaching_flags, threat_flags)):
         if tr.speed_kmh < MIN_SPEED_KMH:
@@ -2650,6 +3216,8 @@ def render_composed_gif(img, calib, target_lat, target_lon, radius_km,
     nf = getattr(img, "n_frames", 1)
     start = max(0, nf - max_frames)
     split_frames_by_id = split_frames_by_id or {}
+    base_win = float(rt.get("velocity_window_min", VELOCITY_WINDOW_MIN))
+    adaptive_win = bool(rt.get("velocity_adaptive", True))
     out = []
     try:
         for fidx in range(start, nf):
@@ -2678,7 +3246,8 @@ def render_composed_gif(img, calib, target_lat, target_lon, radius_km,
                 if len(obs_up_to) < min_obs_needed:
                     continue
                 vx_kmh, vy_kmh = _estimate_velocity_kmh(
-                    obs_up_to, calib, frame_interval_min, split_frames_by_id.get(cid))
+                    obs_up_to, calib, frame_interval_min,
+                    split_frames_by_id.get(cid), base_win, adaptive_win)
                 tr_copy = Track(
                     cluster=PixelCluster(
                         cluster_here.cx, cluster_here.cy,
@@ -2715,7 +3284,7 @@ def render_composed_gif(img, calib, target_lat, target_lon, radius_km,
 
 
 # ----------------------------------------------------------------------------
-# HTTP server
+# HTTP server (Live Dashboard + Separate Offline Replay & Shadow Tuner GUI)
 # ----------------------------------------------------------------------------
 _INDEX_HTML = """<!DOCTYPE html><html><head><title>DHMZ Radar Tracker</title>
 <style>
@@ -2750,9 +3319,10 @@ table.acc td.num{text-align:right;font-variant-numeric:tabular-nums}
 img{max-width:100%;border:1px solid #333;display:block;margin-bottom:12px}
 a{color:#5cf}.hint{color:#666;font-size:11px;margin-top:4px}
 .cfgpath{font-family:monospace;color:#7c7}
+.badge{background:#244866;color:#9df;padding:2px 7px;border-radius:3px;font-size:12px;text-decoration:none}
 </style></head><body>
-<h1>DHMZ Radar Tracker</h1>
-<p><a href="/threat.gif">/threat.gif</a> · <a href="/threat.png">/threat.png</a> · <a href="/status">/status</a> · <a href="/settings">/settings</a> · <a href="/config">/config</a> · <a href="/archive">/archive</a> · <a href="/accuracy">/accuracy</a></p>
+<h1>DHMZ Radar Tracker <a class="badge" href="/replay">Offline Replay & Shadow Tuner →</a></h1>
+<p><a href="/threat.gif">/threat.gif</a> · <a href="/threat.png">/threat.png</a> · <a href="/status">/status</a> · <a href="/settings">/settings</a> · <a href="/config">/config</a> · <a href="/archive">/archive</a> · <a href="/profiles">/profiles</a> · <a href="/accuracy">/accuracy</a></p>
 <div class="layout">
 <div class="left">
 <div class="status" id="status">Loading...</div>
@@ -2772,6 +3342,8 @@ a{color:#5cf}.hint{color:#666;font-size:11px;margin-top:4px}
 <div id="sensors">Loading...</div>
 </div>
 <div class="section"><h3>Runtime settings (hot)</h3>
+<div class="field"><label>Velocity window (min)</label><input type="number" id="velocity_window_min" min="10" max="90" step="5"></div>
+<div class="field"><label>Adaptive velocity window</label><input type="checkbox" id="velocity_adaptive"></div>
 <div class="field"><label>Base approach radius (km)</label><input type="number" id="approaching_radius_km" min="1" max="500" step="5"></div>
 <div class="field"><label>Cluster size weight</label><input type="number" id="cluster_radius_weight" min="0" max="5" step="0.1"></div>
 <div class="field"><label>Hard angle cap (°)</label><input type="number" id="only_approach_deg" min="0" max="180" step="5"></div>
@@ -2801,7 +3373,7 @@ a{color:#5cf}.hint{color:#666;font-size:11px;margin-top:4px}
 <div class="field"><label>Cities</label><input type="checkbox" id="show_cities"></div>
 <div class="field"><label>Poll interval (s)</label><input type="number" id="poll_s" min="30" max="7200" step="30"></div>
 <div class="field"><label>Image scale</label><input type="number" id="web_scale" min="0.1" max="4" step="0.1"></div>
-<div class="field"><label>Settings tag</label><input type="text" id="settings_tag" placeholder="baseline, tuned-v1"></div>
+<div class="field"><label>Settings tag</label><input type="text" id="settings_tag" placeholder="baseline, iter-01"></div>
 <div class="hint">Saved to config.json. Applies next cycle.</div>
 <div class="actions">
 <button onclick="saveAll(false)">Save</button>
@@ -2814,7 +3386,7 @@ a{color:#5cf}.hint{color:#666;font-size:11px;margin-top:4px}
 </div>
 </div>
 <script>
-const RT_FIELDS=['approaching_radius_km','cluster_radius_weight','only_approach_deg','threat_radius_km','threat_angle_deg','threat_min_duration','threat_min_sri_mmh','radius_km','weather_radius_km','archive_enabled','archive_radius_km','archive_min_pixels','min_size_px','min_duration_frames','view_rotation_auto','view_rotation','basemap','basemap_saturation','basemap_brightness','basemap_contrast','show_cities','poll_s','web_scale','settings_tag'];
+const RT_FIELDS=['velocity_window_min','velocity_adaptive','approaching_radius_km','cluster_radius_weight','only_approach_deg','threat_radius_km','threat_angle_deg','threat_min_duration','threat_min_sri_mmh','radius_km','weather_radius_km','archive_enabled','archive_radius_km','archive_min_pixels','min_size_px','min_duration_frames','view_rotation_auto','view_rotation','basemap','basemap_saturation','basemap_brightness','basemap_contrast','show_cities','poll_s','web_scale','settings_tag'];
 const MAIN_SENSORS=['raining_now','raining_confirmed','rain_confidence','rain_duration_min','rain_end_eta_min','next_rain_eta_min','gap_min','summary','radar_intensity_mmh','nearest_station_mm','intensity_mmh','station_trend','upstream_trend','local_temp_c','local_humidity','local_pressure_hpa','local_wind_speed_kmh','local_wind_gust_kmh','local_wind_dir_deg','local_wind_dir','local_rain_today_mm','local_rain_1h_mm','local_rain_rate_mmh'];
 const DIAG_SENSORS=['coverage_map','nowcast_error_min','data_age_min','frame_timestamp','cell_count','nearest_cell_km','nearest_cell_eta_min','nearest_station_km','nearest_station_age_min','station_count_wet','station_count_fresh','station_wet_fraction','station_median_mm','local_weather_stations'];
 function setField(k,v){const el=document.getElementById(k);if(!el)return;if(el.type==='checkbox')el.checked=!!v;else el.value=v;}
@@ -2843,7 +3415,7 @@ function loadStatus(){fetch('/status').then(r=>r.json()).then(s=>{const el=docum
    archEl.innerHTML='<div class="hint">Persistence disabled (no data-dir)</div>';
  }else{
    archEl.innerHTML=`<div class="hint">Status: ${arch.enabled?'Active':'Paused'} (radius ≤ ${arch.radius_km||200} km) · Episodes: <b>${arch.total_episodes||0}</b> · Frames: <b>${arch.total_frames||0}</b></div>
-   <div class="hint">Last episode: <span class="cfgpath">${arch.last_episode||'none'}</span>${arch.last_saved_utc?' · '+arch.last_saved_utc:''}</div>`;
+   <div class="hint">Last episode: <span class="cfgpath">${arch.last_episode||'none'}</span> · <a href="/replay">Open Offline Replay & Shadow Tuner</a></div>`;
  }
  const wx=s.local_weather||{};
  const wxEl=document.getElementById('local_wx');
@@ -2902,6 +3474,341 @@ setInterval(loadStatus,10000);setInterval(loadAccuracy,30000);setInterval(bumpIm
 </script></body></html>"""
 
 
+_REPLAY_HTML = """<!DOCTYPE html><html><head><title>Offline Replay & Shadow Tuner — DHMZ Radar</title>
+<style>
+body{background:#0e1014;color:#dde;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:18px}
+h1{color:#fff;margin:0 0 12px 0;font-size:20px;display:flex;align-items:center;gap:12px}
+.badge{background:#233547;color:#7cf;padding:3px 8px;border-radius:3px;font-size:12px;text-decoration:none}
+.grid{display:flex;gap:18px;flex-wrap:wrap}
+.col-left{flex:1 1 420px;max-width:480px}
+.col-mid{flex:1 1 480px;max-width:560px}
+.col-right{flex:1 1 520px}
+.card{background:#161a20;border:1px solid #2b323d;border-radius:5px;padding:12px;margin-bottom:14px}
+.card h3{margin:0 0 8px 0;font-size:12px;text-transform:uppercase;color:#6cf;letter-spacing:0.6px}
+.row{display:flex;align-items:center;gap:8px;margin-bottom:7px;font-size:13px}
+.row label{flex:1;color:#bcc}
+input[type=number],select,input[type=text]{background:#0b0d10;color:#eee;border:1px solid #333b48;padding:4px 6px;border-radius:3px;font-size:12px}
+input[type=number]{width:80px}
+select{min-width:150px}
+input[type=checkbox]{accent-color:#6cf;width:16px;height:16px}
+button{background:#265b8c;color:#fff;border:0;padding:7px 12px;border-radius:3px;cursor:pointer;font-size:12px;font-weight:500}
+button:hover{background:#3477b5}
+button.purple{background:#663399}button.purple:hover{background:#7d42b8}
+button.green{background:#246b42}button.green:hover{background:#2f8a55}
+button.secondary{background:#383f4a}button.secondary:hover{background:#4a5362}
+button:disabled{opacity:0.45;cursor:wait}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{padding:5px 6px;text-align:left;border-bottom:1px solid #242a34}
+th{color:#7cf;font-size:11px;text-transform:uppercase;font-weight:500}
+td.num{text-align:right;font-variant-numeric:tabular-nums}
+.better{color:#5e8;font-weight:600}.worse{color:#f77}
+.leg-cyan{color:#6ef}.leg-mag{color:#d6f}
+.scrubber{display:flex;align-items:center;gap:8px;margin-top:8px}
+.scrubber input[type=range]{flex:1;accent-color:#6cf}
+img#replay_img{width:100%;max-width:640px;border:1px solid #2b323d;border-radius:4px;display:block;background:#080a0d}
+.hint{color:#778;font-size:11px;margin-top:4px;line-height:1.4}
+.prof-active{border-left:3px solid #5e8;padding-left:6px}
+</style></head><body>
+<h1>Offline Storm Replay & Shadow Auto-Tuner <a class="badge" href="/">← Live Dashboard</a></h1>
+
+<div class="grid">
+  <!-- LEFT: Archive Episode Scrubber & Visual Comparison -->
+  <div class="col-left">
+    <div class="card">
+      <h3>1. Archived Storm Episode</h3>
+      <div class="row">
+        <label>Episode</label>
+        <select id="ep_select" onchange="onEpisodeChange()"></select>
+        <button class="secondary" onclick="loadEpisodes()">Reload</button>
+      </div>
+      <div id="ep_meta" class="hint">Loading archived episodes...</div>
+      <div class="scrubber">
+        <button class="secondary" onclick="stepFrame(-1)">◀</button>
+        <button id="play_btn" class="secondary" onclick="togglePlay()">▶ Play</button>
+        <button class="secondary" onclick="stepFrame(1)">▶</button>
+        <input type="range" id="frame_slider" min="0" max="0" value="0" oninput="renderFrame()">
+        <span id="frame_lbl" style="font-size:12px;min-width:52px;text-align:right">0/0</span>
+      </div>
+      <div class="hint" style="margin-top:6px">
+        Vectors: <span class="leg-cyan">■ Baseline / Active</span> vs <span class="leg-mag">■ Shadow Candidate</span> (1h projected track)
+      </div>
+    </div>
+
+    <img id="replay_img" alt="Archived radar frame">
+  </div>
+
+  <!-- MIDDLE: Shadow Parameters & Two-Stage Tuner -->
+  <div class="col-mid">
+    <div class="card">
+      <h3>2. Shadow Runner Parameters</h3>
+      <div class="row"><label>Load profile into Shadow</label>
+        <select id="profile_select" onchange="loadProfileIntoShadow()"></select>
+      </div>
+      <div class="row"><label>Velocity window (min)</label><input type="number" id="sh_velocity_window_min" min="10" max="90" step="5"></div>
+      <div class="row"><label>Adaptive velocity window</label><input type="checkbox" id="sh_velocity_adaptive"></div>
+      <div class="row"><label>Min cell size (px)</label><input type="number" id="sh_min_size_px" min="5" max="5000" step="5"></div>
+      <div class="row"><label>Min duration (frames)</label><input type="number" id="sh_min_duration_frames" min="1" max="50" step="1"></div>
+      <div class="row"><label>Base approach radius (km)</label><input type="number" id="sh_approaching_radius_km" min="1" max="500" step="2"></div>
+      <div class="row"><label>Cluster size weight</label><input type="number" id="sh_cluster_radius_weight" min="0" max="5" step="0.1"></div>
+      <div class="row"><label>Hard angle cap (°)</label><input type="number" id="sh_only_approach_deg" min="0" max="180" step="5"></div>
+      <div class="row"><label>Threat radius (km)</label><input type="number" id="sh_threat_radius_km" min="1" max="500" step="2"></div>
+      <div class="row"><label>Threat angle (°)</label><input type="number" id="sh_threat_angle_deg" min="0" max="180" step="5"></div>
+      <div class="row"><label>Threat min duration (fr)</label><input type="number" id="sh_threat_min_duration" min="1" max="50" step="1"></div>
+      <div class="row"><label>Threat min SRI (mm/h)</label><input type="number" id="sh_threat_min_sri_mmh" min="0" max="500" step="0.5"></div>
+      <div class="row" style="margin-top:8px">
+        <button onclick="runShadowCompare()">Compare Shadow vs Baseline</button>
+        <button id="tune_btn" class="purple" onclick="runTwoStageTune()">Run 2-Stage Auto-Tuner</button>
+      </div>
+      <div id="tune_status" class="hint">
+        Stage 1 tunes kinematics (speed, heading, 30m miss). Stage 2 refines approach/threat cone geometry (F1 & ETA). Every run is saved as a new profile iteration so baseline is preserved.
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT: Walk-Forward Scorecard & Saved Iterations -->
+  <div class="col-right">
+    <div class="card">
+      <h3>3. Walk-Forward Speed, Heading & Alert Scorecard</h3>
+      <div id="scorecard_box" class="hint">Click "Compare Shadow vs Baseline" or "Run 2-Stage Auto-Tuner" to score across archived storms.</div>
+      <div class="row" style="margin-top:10px">
+        <input type="text" id="save_name" placeholder="Profile name (e.g. iter-01)" style="flex:1">
+        <button class="green" onclick="saveCurrentShadow()">Save Shadow as Profile</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>4. Saved Parameter Iterations (History)</h3>
+      <div id="profiles_box" class="hint">Loading saved profiles...</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const KEYS=['velocity_window_min','velocity_adaptive','min_size_px','min_duration_frames','approaching_radius_km','cluster_radius_weight','only_approach_deg','threat_radius_km','threat_angle_deg','threat_min_duration','threat_min_sri_mmh'];
+let episodes=[];
+let profiles=[];
+let playTimer=null;
+let lastShadowMetrics=null;
+
+function getShadowParams(){
+  const p={};
+  KEYS.forEach(k=>{
+    const el=document.getElementById('sh_'+k);
+    if(!el)return;
+    p[k]=el.type==='checkbox'?el.checked:parseFloat(el.value);
+  });
+  return p;
+}
+
+function setShadowParams(p){
+  KEYS.forEach(k=>{
+    const el=document.getElementById('sh_'+k);
+    if(!el||!(k in p))return;
+    if(el.type==='checkbox')el.checked=!!p[k];
+    else el.value=p[k];
+  });
+}
+
+function loadEpisodes(){
+  fetch('/archive?n=50').then(r=>r.json()).then(d=>{
+    episodes=d.episodes||[];
+    const sel=document.getElementById('ep_select');
+    sel.innerHTML='';
+    if(!episodes.length){
+      document.getElementById('ep_meta').textContent='No archived storm episodes yet. Wait for storms within archive radius.';
+      return;
+    }
+    episodes.forEach((ep,i)=>{
+      const opt=document.createElement('option');
+      opt.value=ep.episode_id;
+      opt.textContent=`${ep.episode_id} (${ep.frame_count} fr, peak ${ep.peak_sri_mmh||'?'} mm/h${ep.target_hit?' · HIT':''})`;
+      sel.appendChild(opt);
+    });
+    onEpisodeChange();
+  });
+}
+
+function onEpisodeChange(){
+  const epId=document.getElementById('ep_select').value;
+  const ep=episodes.find(e=>e.episode_id===epId);
+  const slider=document.getElementById('frame_slider');
+  if(!ep){return;}
+  const maxIdx=Math.max(0,(ep.frame_count||1)-1);
+  slider.max=maxIdx;
+  slider.value=maxIdx;
+  document.getElementById('ep_meta').textContent=`Start: ${ep.start_utc||'?'} · End: ${ep.end_utc||'?'} · Peak SRI: ${ep.peak_sri_mmh||0} mm/h`;
+  renderFrame();
+}
+
+function stepFrame(delta){
+  const slider=document.getElementById('frame_slider');
+  const next=Math.max(0,Math.min(parseInt(slider.max),parseInt(slider.value)+delta));
+  slider.value=next;
+  renderFrame();
+}
+
+function togglePlay(){
+  const btn=document.getElementById('play_btn');
+  if(playTimer){clearInterval(playTimer);playTimer=null;btn.textContent='▶ Play';return;}
+  btn.textContent='⏸ Pause';
+  playTimer=setInterval(()=>{
+    const slider=document.getElementById('frame_slider');
+    let v=parseInt(slider.value)+1;
+    if(v>parseInt(slider.max))v=0;
+    slider.value=v;
+    renderFrame();
+  },450);
+}
+
+function renderFrame(){
+  const epId=document.getElementById('ep_select').value;
+  const slider=document.getElementById('frame_slider');
+  const idx=parseInt(slider.value)||0;
+  const total=parseInt(slider.max)+1;
+  document.getElementById('frame_lbl').textContent=`${idx+1}/${total}`;
+  if(!epId)return;
+  const sh=encodeURIComponent(JSON.stringify(getShadowParams()));
+  document.getElementById('replay_img').src=`/replay/frame?episode=${encodeURIComponent(epId)}&idx=${idx}&shadow=${sh}&t=${Date.now()}`;
+}
+
+function loadProfiles(){
+  fetch('/profiles').then(r=>r.json()).then(d=>{
+    profiles=d.profiles||[];
+    const sel=document.getElementById('profile_select');
+    sel.innerHTML='';
+    profiles.forEach(p=>{
+      const opt=document.createElement('option');
+      opt.value=p.name;
+      const loss=p.metrics&&p.metrics.composite_loss!=null?` [loss ${p.metrics.composite_loss}]`:'';
+      opt.textContent=`${p.name} (${p.stage})${loss}`;
+      sel.appendChild(opt);
+    });
+    if(profiles.length){
+      const latest=profiles[profiles.length-1];
+      sel.value=latest.name;
+      setShadowParams(latest.params);
+      renderFrame();
+    }
+    renderProfilesTable();
+  });
+}
+
+function loadProfileIntoShadow(){
+  const name=document.getElementById('profile_select').value;
+  const p=profiles.find(x=>x.name===name);
+  if(p){setShadowParams(p.params);renderFrame();}
+}
+
+function renderProfilesTable(){
+  const box=document.getElementById('profiles_box');
+  if(!profiles.length){box.textContent='No profiles saved.';return;}
+  let html='<table><tr><th>Profile</th><th>Win</th><th>Adapt</th><th>30m Miss</th><th>Hdg MAE</th><th>F1</th><th>Loss</th><th>Actions</th></tr>';
+  profiles.forEach(p=>{
+    const m=p.metrics||{};
+    const pr=p.params||{};
+    html+=`<tr>
+      <td><b>${p.name}</b><br><span class="hint">${p.stage}</span></td>
+      <td class="num">${pr.velocity_window_min||'—'}m</td>
+      <td>${pr.velocity_adaptive?'on':'off'}</td>
+      <td class="num">${m.pos_miss_30m_km!=null?m.pos_miss_30m_km+' km':'—'}</td>
+      <td class="num">${m.heading_mae_deg!=null?m.heading_mae_deg+'°':'—'}</td>
+      <td class="num">${m.f1!=null?m.f1:'—'}</td>
+      <td class="num">${m.composite_loss!=null?m.composite_loss:'—'}</td>
+      <td>
+        <button class="secondary" onclick="applyProfile('${p.name}')">Load</button>
+        <button class="green" onclick="promoteProfile('${p.name}')">Adopt Live</button>
+      </td>
+    </tr>`;
+  });
+  html+='</table>';
+  box.innerHTML=html;
+}
+
+function applyProfile(name){
+  const p=profiles.find(x=>x.name===name);
+  if(p){setShadowParams(p.params);document.getElementById('profile_select').value=name;renderFrame();}
+}
+
+function promoteProfile(name){
+  if(!confirm(`Promote profile "${name}" to live config.json? (Baseline remains safely stored in profiles.json)`))return;
+  fetch('/profiles/promote',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})})
+  .then(r=>r.json()).then(d=>{
+    alert(d.ok?`Promoted "${name}" to live config.json!`:`Error: ${d.error}`);
+  });
+}
+
+function fmtDelta(baseVal, shVal, lowerIsBetter, unit=''){
+  if(baseVal==null||shVal==null)return '—';
+  const diff=shVal-baseVal;
+  if(Math.abs(diff)<1e-3)return `${shVal}${unit}`;
+  const good=lowerIsBetter?(diff<0):(diff>0);
+  const sign=diff>0?'+':'';
+  return `<span class="${good?'better':'worse'}">${shVal}${unit} (${sign}${diff.toFixed(2)})</span>`;
+}
+
+function renderScorecard(base, sh){
+  lastShadowMetrics=sh;
+  const rows=[
+    ['30-min Track Miss (km)', base.pos_miss_30m_km, sh.pos_miss_30m_km, true, ' km'],
+    ['Heading MAE (°)', base.heading_mae_deg, sh.heading_mae_deg, true, '°'],
+    ['Speed MAE (km/h)', base.speed_mae_kmh, sh.speed_mae_kmh, true, ' km/h'],
+    ['Avg Adaptive Window', base.avg_eff_window_min, sh.avg_eff_window_min, false, ' min'],
+    ['Alert Precision', base.precision, sh.precision, false, ''],
+    ['Alert Recall', base.recall, sh.recall, false, ''],
+    ['Alert F1 Score', base.f1, sh.f1, false, ''],
+    ['Arrival ETA MAE (min)', base.eta_mae_min, sh.eta_mae_min, true, ' min'],
+    ['Composite Loss (lower=better)', base.composite_loss, sh.composite_loss, true, ''],
+  ];
+  let html=`<div class="hint" style="margin-bottom:6px">Evaluated ${sh.episodes_evaluated} storm episode(s), ${sh.kinematic_samples} walk-forward steps</div>`;
+  html+='<table><tr><th>Metric</th><th class="num">Baseline</th><th class="num">Shadow</th></tr>';
+  rows.forEach(([lbl,bv,sv,low,u])=>{
+    html+=`<tr><td>${lbl}</td><td class="num">${bv!=null?bv+u:'—'}</td><td class="num">${fmtDelta(bv,sv,low,u)}</td></tr>`;
+  });
+  html+='</table>';
+  document.getElementById('scorecard_box').innerHTML=html;
+}
+
+function runShadowCompare(){
+  document.getElementById('tune_status').textContent='Running walk-forward evaluation...';
+  fetch('/replay/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({shadow:getShadowParams()})})
+  .then(r=>r.json()).then(d=>{
+    if(d.error){document.getElementById('tune_status').textContent='Error: '+d.error;return;}
+    renderScorecard(d.baseline,d.shadow);
+    renderFrame();
+    document.getElementById('tune_status').textContent='Walk-forward comparison complete.';
+  });
+}
+
+function runTwoStageTune(){
+  const btn=document.getElementById('tune_btn');
+  btn.disabled=true;
+  document.getElementById('tune_status').textContent='Running Stage 1 (kinematics) & Stage 2 (alert cone) across archived storms...';
+  fetch('/replay/autotune',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({base:getShadowParams(),save:true})})
+  .then(r=>r.json()).then(d=>{
+    btn.disabled=false;
+    if(!d.ok){document.getElementById('tune_status').textContent='Tuner error: '+(d.error||'failed');return;}
+    setShadowParams(d.tuned_params);
+    renderScorecard(d.baseline_metrics,d.tuned_metrics);
+    loadProfiles();
+    renderFrame();
+    document.getElementById('tune_status').textContent=`Saved new tuned iteration "${d.saved_profile}" (loss ${d.baseline_metrics.composite_loss} → ${d.tuned_metrics.composite_loss}).`;
+  }).catch(e=>{btn.disabled=false;});
+}
+
+function saveCurrentShadow(){
+  const name=document.getElementById('save_name').value.trim();
+  fetch('/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name||null,params:getShadowParams(),metrics:lastShadowMetrics,stage:'manual'})})
+  .then(r=>r.json()).then(d=>{
+    document.getElementById('save_name').value='';
+    loadProfiles();
+  });
+}
+
+loadEpisodes();
+loadProfiles();
+</script></body></html>"""
+
+
 class _VizHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -2912,7 +3819,11 @@ class _VizHandler(BaseHTTPRequestHandler):
                 k, v = part.split("=", 1)
                 params[k] = v
         if path == "/":
-            self._html()
+            self._html(_INDEX_HTML)
+        elif path == "/replay":
+            self._html(_REPLAY_HTML)
+        elif path == "/replay/frame":
+            self._replay_frame(params)
         elif path == "/threat.png":
             self._bytes("png", "image/png")
         elif path == "/threat.gif":
@@ -2925,6 +3836,8 @@ class _VizHandler(BaseHTTPRequestHandler):
             self._config_get()
         elif path == "/archive":
             self._archive(params)
+        elif path == "/profiles":
+            self._profiles_get()
         elif path == "/accuracy":
             self._accuracy(params)
         elif path == "/accuracy/predictions":
@@ -2940,6 +3853,14 @@ class _VizHandler(BaseHTTPRequestHandler):
             self._settings_post()
         elif path == "/config":
             self._config_post()
+        elif path == "/replay/run":
+            self._replay_run()
+        elif path == "/replay/autotune":
+            self._replay_autotune()
+        elif path == "/profiles":
+            self._profiles_post()
+        elif path == "/profiles/promote":
+            self._profiles_promote()
         elif path == "/refresh":
             _FORCE_REFRESH.set()
             self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
@@ -2955,7 +3876,8 @@ class _VizHandler(BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers()
 
     def do_DELETE(self):
-        if self.path.split("?")[0] == "/config":
+        path = self.path.split("?")[0]
+        if path == "/config":
             cfg_path = _VIZ_STATE.get("config_path")
             if cfg_path:
                 for p in (cfg_path, cfg_path + ".bak"):
@@ -2964,6 +3886,13 @@ class _VizHandler(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
         else:
             self.send_response(404); self.end_headers()
+
+    def _read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(length)) if length > 0 else {}
+        except Exception:
+            return None
 
     def _json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -3000,6 +3929,175 @@ class _VizHandler(BaseHTTPRequestHandler):
         res["episodes"] = arch.list_episodes(limit=limit)
         self._json(res)
 
+    def _profiles_get(self):
+        ps = _VIZ_STATE.get("profile_store")
+        if not ps:
+            self._json({"profiles": []}); return
+        self._json({"profiles": ps.list_all()})
+
+    def _profiles_post(self):
+        ps = _VIZ_STATE.get("profile_store")
+        body = self._read_json_body()
+        if not ps or body is None:
+            self._json({"ok": False, "error": "invalid request"}, 400); return
+        name = body.get("name") or ps.next_iter_name()
+        params = body.get("params") or _snapshot()
+        metrics = body.get("metrics")
+        stage = body.get("stage") or "manual"
+        saved = ps.save_profile(name, params, metrics=metrics, stage=stage)
+        self._json({"ok": True, "profile": saved})
+
+    def _profiles_promote(self):
+        ps = _VIZ_STATE.get("profile_store")
+        body = self._read_json_body()
+        if not ps or not body or "name" not in body:
+            self._json({"ok": False, "error": "missing profile name"}, 400); return
+        prof = ps.get(body["name"])
+        if not prof:
+            self._json({"ok": False, "error": "profile not found"}, 404); return
+        ps.ensure_baseline(_snapshot())
+        with _RUNTIME_LOCK:
+            for k, v in prof["params"].items():
+                if k in _RUNTIME_TYPES:
+                    _RUNTIME[k] = _coerce(k, v)
+            _RUNTIME["settings_tag"] = prof["name"]
+            current = dict(_RUNTIME)
+        cfg_path = _VIZ_STATE.get("config_path")
+        if cfg_path:
+            existing = _load_json_file(cfg_path) or {}
+            now = datetime.now(timezone.utc).isoformat()
+            _save_json_file(cfg_path, {
+                "version": 1,
+                "created_at": existing.get("created_at", now),
+                "updated_at": now,
+                "runtime": current,
+                "static": existing.get("static") or _static_snapshot(),
+            })
+        self._json({"ok": True, "active_profile": prof["name"], "settings": current})
+
+    def _replay_run(self):
+        eng = _VIZ_STATE.get("replay_engine")
+        ps = _VIZ_STATE.get("profile_store")
+        body = self._read_json_body()
+        if not eng or body is None:
+            self._json({"error": "replay engine unavailable"}, 503); return
+        base_prof = ps.get("baseline") if ps else None
+        base_params = base_prof["params"] if base_prof else _snapshot()
+        shadow_params = dict(base_params)
+        shadow_params.update(body.get("shadow") or {})
+        ep_ids = body.get("episodes")
+        base_res = eng.evaluate_params(base_params, episode_ids=ep_ids)
+        shad_res = eng.evaluate_params(shadow_params, episode_ids=ep_ids)
+        if ps and base_prof and base_prof.get("metrics") is None:
+            ps.save_profile("baseline", base_params, metrics=base_res, parent=None, stage="initial")
+        self._json({"baseline": base_res, "shadow": shad_res})
+
+    def _replay_autotune(self):
+        eng = _VIZ_STATE.get("replay_engine")
+        ps = _VIZ_STATE.get("profile_store")
+        body = self._read_json_body() or {}
+        if not eng:
+            self._json({"ok": False, "error": "replay engine unavailable"}, 503); return
+        base_params = body.get("base") or _snapshot()
+        res = eng.run_two_stage_autotune(base_params, episode_ids=body.get("episodes"))
+        if not res.get("ok"):
+            self._json(res); return
+        if ps:
+            ps.ensure_baseline(base_params)
+            if ps.get("baseline").get("metrics") is None:
+                ps.save_profile("baseline", base_params, metrics=res["baseline_metrics"],
+                                parent=None, stage="initial")
+            if body.get("save", True):
+                iter_name = ps.next_iter_name()
+                ps.save_profile(iter_name, res["tuned_params"],
+                                metrics=res["tuned_metrics"],
+                                parent="baseline", stage="2-stage-autotune")
+                res["saved_profile"] = iter_name
+        self._json(res)
+
+    def _replay_frame(self, params):
+        import urllib.parse
+        eng = _VIZ_STATE.get("replay_engine")
+        ps = _VIZ_STATE.get("profile_store")
+        if not eng:
+            self.send_response(503); self.end_headers(); return
+        ep_id = urllib.parse.unquote(params.get("episode", ""))
+        idx = int(params.get("idx", 0))
+        data = eng.get_episode_data(ep_id)
+        if not data:
+            self.send_response(404); self.end_headers(); return
+        idx = max(0, min(len(data) - 1, idx))
+        prefix_mmh = [(d[1], d[2]) for d in data[:idx + 1]]
+
+        base_prof = ps.get("baseline") if ps else None
+        base_rt = _snapshot()
+        if base_prof:
+            base_rt.update(base_prof["params"])
+
+        shadow_rt = dict(base_rt)
+        if "shadow" in params:
+            try:
+                sh_raw = json.loads(urllib.parse.unquote(params["shadow"]))
+                for k, v in sh_raw.items():
+                    if k in _RUNTIME_TYPES:
+                        shadow_rt[k] = _coerce(k, v)
+            except Exception:
+                pass
+
+        # Run baseline and shadow up to frame idx
+        (_, _, b_tracks, _, _, _, _, _) = track_frame_sequence(
+            prefix_mmh, eng.calib, eng.frame_interval_min,
+            eng.target_lat, eng.target_lon, rt=base_rt)
+        b_tracks = [t for t in b_tracks
+                    if t.n_observations >= min(base_rt["min_duration_frames"], idx + 1)
+                    and t.cluster.size >= base_rt["min_size_px"]]
+        b_appr = [assess(t, eng.target_lat, eng.target_lon, eng.calib) for t in b_tracks]
+        b_af = [refine_approaching(t, a, base_rt) for t, a in zip(b_tracks, b_appr)]
+        b_tf = [refine_threat(t, a, base_rt) for t, a in zip(b_tracks, b_appr)]
+
+        (_, _, s_tracks, _, _, _, _, _) = track_frame_sequence(
+            prefix_mmh, eng.calib, eng.frame_interval_min,
+            eng.target_lat, eng.target_lon, rt=shadow_rt)
+        s_tracks = [t for t in s_tracks
+                    if t.n_observations >= min(shadow_rt["min_duration_frames"], idx + 1)
+                    and t.cluster.size >= shadow_rt["min_size_px"]]
+
+        ts, mask, mmh, _, fname = data[idx]
+        gray = _radar_to_grayscale(mask, mmh)
+        rt_cur = _snapshot()
+        _, view_rot_used = get_effective_rotation(rt_cur, eng.target_lat, eng.target_lon)
+        static_cur = _static_snapshot()
+        size_px = static_cur.get("basemap_size") or 640
+        bm_img = None
+        bm_kind = "greyscale"
+        if static_cur.get("mapbox_token") and rt_cur.get("basemap") in ("auto", "mapbox"):
+            bm_img = fetch_basemap(
+                static_cur.get("mapbox_style") or "mapbox/satellite-v9",
+                static_cur["mapbox_token"], eng.target_lat, eng.target_lon,
+                rt_cur["radius_km"], view_rot_used, size_px, _VIZ_STATE.get("data_dir"))
+            if bm_img is not None:
+                bm_kind = "mapbox"
+
+        pil = compose_map(
+            mask, mmh, gray, eng.calib, eng.target_lat, eng.target_lon,
+            rt_cur["radius_km"], view_rot_used, size_px, bm_img, bm_kind,
+            b_tracks, b_appr, b_af, b_tf, [], rt_cur["show_cities"],
+            eng.intensity_mode, DEFAULT_SRI_THRESHOLDS, rt_cur,
+            shadow_tracks=s_tracks)
+        draw = ImageDraw.Draw(pil)
+        ts_lbl = ts.strftime("%Y-%m-%d %H:%MZ") if ts else fname
+        _draw_text_outlined(draw, 10, 8, f"REPLAY {ep_id} | {ts_lbl} ({idx+1}/{len(data)})",
+                            (255, 220, 60), (0, 0, 0))
+        buf = io.BytesIO()
+        pil.save(buf, format="PNG", optimize=True)
+        out_bytes = buf.getvalue()
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(out_bytes)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(out_bytes)
+
     def _config_get(self):
         cfg_path = _VIZ_STATE.get("config_path")
         if cfg_path and os.path.exists(cfg_path):
@@ -3013,16 +4111,12 @@ class _VizHandler(BaseHTTPRequestHandler):
                         "runtime": _snapshot(), "static": _static_snapshot()})
 
     def _config_post(self):
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            new_cfg = json.loads(self.rfile.read(length))
-        except Exception:
+        new_cfg = self._read_json_body()
+        if not isinstance(new_cfg, dict):
             self._json({"ok": False, "error": "bad request"}, 400); return
         cfg_path = _VIZ_STATE.get("config_path")
         if not cfg_path:
             self._json({"ok": False, "error": "no config path"}, 400); return
-        if not isinstance(new_cfg, dict):
-            self._json({"ok": False, "error": "config must be object"}, 400); return
         existing = _load_json_file(cfg_path) or {}
         now = datetime.now(timezone.utc).isoformat()
         if new_cfg.get("static", {}).get("mapbox_token") == "***":
@@ -3036,10 +4130,8 @@ class _VizHandler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "save failed"}, 500)
 
     def _settings_post(self):
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            updates = json.loads(self.rfile.read(length))
-        except Exception:
+        updates = self._read_json_body()
+        if updates is None:
             self._json({"ok": False, "error": "bad request"}, 400); return
         changed = []
         with _RUNTIME_LOCK:
@@ -3082,8 +4174,8 @@ class _VizHandler(BaseHTTPRequestHandler):
         self._json(acc.recent_outcomes(n=int(params.get("n", 50)),
                                        kind=params.get("kind")))
 
-    def _html(self):
-        body = _INDEX_HTML.encode("utf-8")
+    def _html(self, html_str):
+        body = html_str.encode("utf-8")
         self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body))); self.end_headers()
         self.wfile.write(body)
@@ -3369,646 +4461,451 @@ def parse_sensor_list(spec):
 class HAPublisher:
     def __init__(self, host, port, user, password, use_tls,
                  discovery_prefix, state_prefix, device_id, device_name,
-                 target_name, sensors, mark_offline_on_exit, retain=True,
-                 threat_topic=None):
-        if not HAVE_MQTT: raise RuntimeError("paho-mqtt not installed")
-        self.host, self.port = host, port
-        self.dp = discovery_prefix; self.sp = state_prefix
+                 enabled_keys, retain=True, threat_topic=None,
+                 web_port=None):
+        if not HAVE_MQTT: raise RuntimeError("paho-mqtt required")
+        self.disc = discovery_prefix.rstrip("/")
+        self.base = f"{state_prefix.rstrip('/')}/{device_id}"
+        self.avail_topic = f"{self.base}/availability"
         self.device_id = device_id; self.device_name = device_name
-        self.target_name = target_name; self.sensors = sensors
-        self.mark_offline = mark_offline_on_exit; self.retain = retain
-        self.threat_topic = threat_topic; self.connected = False
-        self.client = mqtt.Client(client_id=f"{device_id}_pub", clean_session=True)
+        self.enabled_keys = list(enabled_keys)
+        self.retain = retain; self.threat_topic = threat_topic
+        self.web_port = web_port
+        self.connected = threading.Event()
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                                  client_id=f"dhmz-radar-{device_id}")
         if user: self.client.username_pw_set(user, password)
         if use_tls: self.client.tls_set()
-        self.client.reconnect_delay_set(min_delay=2, max_delay=30)
+        self.client.will_set(self.avail_topic, "offline", retain=True, qos=1)
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
+        self.client.connect(host, port, keepalive=60)
+        self.client.loop_start()
+        if not self.connected.wait(timeout=10):
+            raise RuntimeError(f"MQTT connect timeout to {host}:{port}")
 
-    def _on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            self.connected = True
-            print(f"MQTT: connected {self.host}:{self.port}")
-            self._discovery(); self._avail(True)
-        else:
-            print(f"MQTT: connect failed rc={rc}", file=sys.stderr)
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        self.connected.set()
+        client.publish(self.avail_topic, "online", retain=True, qos=1)
+        self.publish_discovery()
 
-    def _on_disconnect(self, client, userdata, rc):
-        self.connected = False
+    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
+        self.connected.clear()
 
-    def connect(self):
+    def publish_discovery(self):
+        dev = {"identifiers": [self.device_id], "name": self.device_name,
+               "manufacturer": "DHMZ + pljusak.com", "model": "radar-nowcaster"}
+        if self.web_port:
+            dev["configuration_url"] = f"http://localhost:{self.web_port}/"
+        for key in self.enabled_keys:
+            spec = SENSORS[key]; uid = f"{self.device_id}_{key}"
+            cfg = {"name": spec.name, "unique_id": uid,
+                   "state_topic": f"{self.base}/{key}",
+                   "availability_topic": self.avail_topic,
+                   "payload_available": "online", "payload_not_available": "offline",
+                   "device": dev}
+            if spec.device_class: cfg["device_class"] = spec.device_class
+            if spec.unit: cfg["unit_of_measurement"] = spec.unit
+            if spec.icon: cfg["icon"] = spec.icon
+            if spec.diagnostic: cfg["entity_category"] = "diagnostic"
+            if spec.component == "binary_sensor":
+                cfg["payload_on"] = "ON"; cfg["payload_off"] = "OFF"
+            if key == "summary":
+                cfg["json_attributes_topic"] = f"{self.base}/summary_attrs"
+            if key == "coverage_map" and self.web_port:
+                cfg["json_attributes_topic"] = f"{self.base}/coverage_attrs"
+            self.client.publish(f"{self.disc}/{spec.component}/{uid}/config",
+                                json.dumps(cfg), retain=True, qos=1)
+
+    def publish_states(self, values, summary_attrs=None, coverage_attrs=None):
+        if not self.connected.is_set():
+            if not self.connected.wait(timeout=5): return
+        for key in self.enabled_keys:
+            if key not in values: continue
+            v = values[key]
+            if isinstance(v, bool): payload = "ON" if v else "OFF"
+            elif v is None: payload = "unknown"
+            elif isinstance(v, float): payload = f"{v:.2f}".rstrip("0").rstrip(".")
+            else: payload = str(v)
+            self.client.publish(f"{self.base}/{key}", payload, retain=self.retain, qos=0)
+        if summary_attrs is not None and "summary" in self.enabled_keys:
+            self.client.publish(f"{self.base}/summary_attrs",
+                                json.dumps(summary_attrs), retain=self.retain, qos=0)
+        if coverage_attrs is not None and "coverage_map" in self.enabled_keys:
+            self.client.publish(f"{self.base}/coverage_attrs",
+                                json.dumps(coverage_attrs), retain=self.retain, qos=0)
+
+    def publish_threat(self, event):
+        if self.threat_topic:
+            self.client.publish(self.threat_topic, json.dumps(event), retain=False, qos=1)
+
+    def close(self, mark_offline=True):
         try:
-            self.client.connect_async(self.host, self.port, keepalive=60)
-            self.client.loop_start()
-        except Exception as e: print(f"MQTT: connection error {e}", file=sys.stderr)
-
-    def _discovery(self):
-        avail = f"{self.sp}/{self.device_id}/availability"
-        for key in self.sensors:
-            spec = SENSORS[key]
-            payload = {"name": spec.name, "unique_id": f"{self.device_id}_{key}",
-                       "state_topic": f"{self.sp}/{self.device_id}/{key}/state",
-                       "availability_topic": avail,
-                       "device": {"identifiers": [self.device_id], "name": self.device_name,
-                                  "manufacturer": "DHMZ+pljusak",
-                                  "model": f"Radar+station — {self.target_name}"}}
-            if spec.device_class: payload["device_class"] = spec.device_class
-            if spec.unit: payload["unit_of_measurement"] = spec.unit
-            if spec.icon: payload["icon"] = spec.icon
-            if spec.diagnostic: payload["entity_category"] = "diagnostic"
-            self.client.publish(f"{self.dp}/{spec.component}/{self.device_id}/{key}/config",
-                                json.dumps(payload), retain=True)
-
-    def _avail(self, online):
-        self.client.publish(f"{self.sp}/{self.device_id}/availability",
-                            "online" if online else "offline", retain=self.retain)
-
-    def publish_states(self, states):
-        if not self.connected: return
-        for key, v in states.items():
-            if key not in self.sensors: continue
-            topic = f"{self.sp}/{self.device_id}/{key}/state"
-            if v is None:
-                self.client.publish(topic, "", retain=self.retain); continue
-            if isinstance(v, bool): p = "ON" if v else "OFF"
-            elif isinstance(v, datetime): p = v.astimezone(timezone.utc).isoformat()
-            else: p = str(v)
-            self.client.publish(topic, p, retain=self.retain)
-
-    def publish_threat(self, payload):
-        if not self.connected or not self.threat_topic: return
-        try:
-            self.client.publish(self.threat_topic,
-                                json.dumps(payload, ensure_ascii=False), retain=False)
-        except Exception as e: print(f"MQTT: threat publish error {e}", file=sys.stderr)
-
-    def disconnect(self):
-        try:
-            if self.mark_offline: self._avail(False)
+            if mark_offline: self.client.publish(self.avail_topic, "offline", retain=True, qos=1)
             time.sleep(0.2); self.client.loop_stop(); self.client.disconnect()
         except Exception: pass
 
 
 # ----------------------------------------------------------------------------
-# Main loop
+# Rotation helper
 # ----------------------------------------------------------------------------
-def run(target_name, t_lat, t_lon, calib, once, dump_jsonl,
-        frame_interval_min, auto_frame_interval,
-        timestamp_region, timestamp_source, timestamp_tz,
-        display_tz, display_tz_name, ha, pljusak, pljusak_interval,
-        intensity_mode, sri_legend, sri_thresholds,
-        confirm_radius, confirm_mm, confirm_age,
-        confirm_frac, confirm_min_count, threat_topic,
-        web_enabled, web_port, acc_store, archiver, data_dir,
-        mapbox_token, mapbox_style, basemap_size):
-    out_fh = open(dump_jsonl, "a") if dump_jsonl else None
-    rt = _snapshot()
-    print(f"Target: {target_name} ({t_lat:.4f}, {t_lon:.4f})")
-    if data_dir:
-        print(f"Data dir: {data_dir}")
-    print(f"Runtime: radius={rt['radius_km']:g}km "
-          f"wx_radius={rt['weather_radius_km']:g}km "
-          f"archive={'on' if rt['archive_enabled'] else 'off'}({rt['archive_radius_km']:g}km) "
-          f"approach={rt['approaching_radius_km']:g}km "
-          f"threat={rt['threat_radius_km']:g}km "
-          f"min_sri={rt['threat_min_sri_mmh']:g}mm/h "
-          f"basemap={rt['basemap']} "
-          f"rot={'auto' if rt['view_rotation_auto'] else rt['view_rotation']}")
-    print(f"Pljusak: {'on' if pljusak else 'off'} | HA: {'on' if ha else 'off'} | "
-          f"Web: " + (f"http://0.0.0.0:{web_port}" if web_enabled else "off"))
-    print(f"Frame interval: {frame_interval_min:.1f} min | once: {once}\n")
+def get_effective_rotation(rt, target_lat, target_lon, basemap_north_up=None):
+    if not rt["view_rotation_auto"]:
+        return False, float(rt["view_rotation"]) % 360.0
 
-    legend_mask = None
-    last_pljusak = None
-    prev_threat_keys = set()
-    prev_raining_now = None
-    cached_basemap = None
-    cached_basemap_key = None
-    cached_basemap_kind = "greyscale"
-    cached_coast_rot = None
-    cached_coast_rot_key = None
+    sat_rot = detect_coast_rotation_from_satellite(basemap_north_up)
+    if sat_rot is not None:
+        return True, sat_rot
 
-    def maybe_pljusak():
-        nonlocal last_pljusak
-        if pljusak is None: return
-        now = datetime.now(timezone.utc)
-        if last_pljusak is None or (now - last_pljusak).total_seconds() >= pljusak_interval:
-            if pljusak.fetch(now): last_pljusak = now
-
-    def get_rotation_with_satellite(rt_current):
-        nonlocal cached_coast_rot, cached_coast_rot_key
-        if not rt_current["view_rotation_auto"]:
-            return False, rt_current["view_rotation"]
-
-        bm = rt_current["basemap"]
-        use_sat = bool(mapbox_token) and bm in ("auto", "mapbox")
-        c_key = (use_sat, mapbox_style, mapbox_token, t_lat, t_lon,
-                 rt_current["radius_km"], basemap_size)
-        if c_key == cached_coast_rot_key and cached_coast_rot is not None:
-            return True, cached_coast_rot
-
-        rot = None
-        if use_sat:
-            sat_north_up = fetch_basemap(
-                mapbox_style, mapbox_token, t_lat, t_lon,
-                rt_current["radius_km"], 0.0, basemap_size, data_dir)
-            rot = detect_coast_rotation_from_satellite(sat_north_up)
-
-        if rot is None:
-            rot, _ = compute_coast_rotation(t_lat, t_lon)
-        if rot is None:
-            rot = rt_current["view_rotation"]
-
-        cached_coast_rot = rot
-        cached_coast_rot_key = c_key
+    rot, dist = compute_coast_rotation(target_lat, target_lon)
+    if rot is not None:
         return True, rot
-
-    def resolve_basemap(rt_current, view_rot_used):
-        bm = rt_current["basemap"]
-        if bm == "none":
-            return None, "none"
-        if bm == "greyscale":
-            return None, "greyscale"
-        if bm == "mapbox" and not mapbox_token:
-            print("WARNING: basemap=mapbox but no token set; falling back to greyscale",
-                  file=sys.stderr)
-            return None, "greyscale"
-        if bm in ("mapbox", "auto") and mapbox_token:
-            img = fetch_basemap(mapbox_style, mapbox_token, t_lat, t_lon,
-                                rt_current["radius_km"], view_rot_used,
-                                basemap_size, data_dir)
-            if img is not None:
-                return img, "mapbox"
-        return None, "greyscale"
-
-    try:
-        while True:
-            try:
-                rt = _snapshot()
-                cur_tag = rt["settings_tag"]
-                view_rot_auto, view_rot_used = get_rotation_with_satellite(rt)
-
-                maybe_pljusak()
-                img = fetch_image(GIF_URL)
-                now_utc = datetime.now(timezone.utc)
-                now_iso = now_utc.isoformat()
-                now_local = now_utc.astimezone(display_tz)
-                tz_ab = tz_abbrev(now_local)
-
-                if sri_legend is not None and not sri_legend.is_ready():
-                    try: img.seek(0)
-                    except Exception: pass
-                    sri_legend.calibrate(img.convert("RGB"))
-                    sri_legend.print_samples()
-                    try:
-                        img.seek(0); f0 = img.convert("RGB")
-                        h_full, w_full = f0.size[1], f0.size[0]
-                    except Exception: h_full, w_full = None, None
-                    if h_full and w_full:
-                        lx0, ly0, lx1, ly1 = sri_legend.region
-                        legend_mask = np.zeros((h_full, w_full), dtype=bool)
-                        legend_mask[max(0, ly0):min(h_full, ly1),
-                                    max(0, lx0):min(w_full, lx1)] = True
-                    try: img.seek(0)
-                    except Exception: pass
-
-                frame_ts_utc, frame_raw, ts_idx = read_frame_timestamp(
-                    img, timestamp_region, timestamp_tz, timestamp_source)
-                data_age_min = ((now_utc - frame_ts_utc).total_seconds() / 60.0
-                                if frame_ts_utc else None)
-
-                eff_interval = frame_interval_min
-                if auto_frame_interval and HAVE_TESSERACT and timestamp_region:
-                    first_ts, _, _ = read_frame_timestamp(
-                        img, timestamp_region, timestamp_tz, "first")
-                    nf = getattr(img, "n_frames", 1)
-                    if first_ts and frame_ts_utc and nf > 1:
-                        span = (frame_ts_utc - first_ts).total_seconds() / 60.0
-                        if span > 0: eff_interval = span / (nf - 1)
-
-                (last_mask, last_mmh, tracks, n_frames, rain_history,
-                 label_array, tracks_by_id, split_frames_by_id,
-                 cluster_first_hit, frame_masks_mmh) = track_animation(
-                    img, calib, eff_interval, t_lat, t_lon, intensity_mode,
-                    sri_legend, legend_mask)
-
-                filtered = []
-                for tr in tracks:
-                    if tr.n_observations < rt["min_duration_frames"]: continue
-                    if tr.cluster.size < rt["min_size_px"]: continue
-                    filtered.append(tr)
-                tracks = filtered
-
-                approaches = [assess(tr, t_lat, t_lon, calib) for tr in tracks]
-                approaching_flags = [refine_approaching(tr, a, rt)
-                                     for tr, a in zip(tracks, approaches)]
-                threat_flags = [refine_threat(tr, a, rt)
-                                for tr, a in zip(tracks, approaches)]
-                n_approaching = sum(approaching_flags)
-
-                nc = compute_nowcast(calib, t_lat, t_lon, tracks, approaches,
-                                     rain_history, label_array, eff_interval, rt)
-
-                wx_radius = float(rt.get("weather_radius_km", 5.0))
-                nearby_stations = []
-                all_stations = []
-                if pljusak is not None:
-                    nearby_stations = pljusak.analyze_nearby(
-                        t_lat, t_lon, max(confirm_radius * 2, wx_radius * 2, 40),
-                        display_tz, max_age_min=confirm_age * 2)
-                    all_stations = pljusak.get_all_stations(
-                        t_lat, t_lon, display_tz)
-
-                lw = summarize_local_weather(nearby_stations, wx_radius, confirm_age)
-
-                ca = combine_analysis(nc.raining_now, nearby_stations, tracks, approaches,
-                                      calib, t_lat, t_lon, confirm_radius,
-                                      confirm_mm, confirm_age,
-                                      confirm_frac, confirm_min_count, rt)
-
-                archived_now = 0
-                if archiver is not None:
-                    last_frame_utc = frame_ts_utc
-                    if last_frame_utc and timestamp_source == "first" and n_frames > 1:
-                        last_frame_utc = last_frame_utc + timedelta(
-                            minutes=(n_frames - 1) * eff_interval)
-                    archived_now = archiver.process_animation(
-                        img, frame_masks_mmh, last_frame_utc, eff_interval,
-                        now_utc, rt, local_weather=lw,
-                        target_raining=ca.raining_now)
-
-                if acc_store and acc_store.enabled:
-                    settings_snapshot = {k: rt[k] for k in
-                                         ("approaching_radius_km", "cluster_radius_weight",
-                                          "only_approach_deg", "threat_radius_km",
-                                          "threat_angle_deg", "threat_min_duration",
-                                          "threat_min_sri_mmh")}
-                    if (not nc.raining_now) and nc.next_rain_eta_min is not None:
-                        acc_store.predict(now_iso, "rain_start", nc.next_rain_eta_min,
-                                          tag=cur_tag, settings=settings_snapshot)
-                    if nc.raining_now and nc.rain_end_eta_min is not None:
-                        acc_store.predict(now_iso, "rain_end", nc.rain_end_eta_min,
-                                          tag=cur_tag, settings=settings_snapshot)
-                    for tr, a, af, tf in zip(tracks, approaches, approaching_flags, threat_flags):
-                        if af and a.eta_min is not None \
-                                and tr.cid not in acc_store.observed_cluster_arrivals:
-                            acc_store.predict(now_iso, "cluster_arrive", a.eta_min,
-                                              key=str(tr.cid), tag=cur_tag,
-                                              settings=settings_snapshot)
-                        if tf:
-                            acc_store.predict(now_iso, "threat", 0.0,
-                                              key=str(tr.cid), tag=cur_tag,
-                                              settings=settings_snapshot)
-                    if prev_raining_now is not None and prev_raining_now != ca.raining_now:
-                        acc_store.observe(now_iso,
-                                          "rain_start" if ca.raining_now else "rain_end",
-                                          tag=cur_tag)
-                    prev_raining_now = ca.raining_now
-                    for cid, first_hit_frame in cluster_first_hit.items():
-                        if cid in acc_store.observed_cluster_arrivals: continue
-                        arrival_min_ago = (n_frames - 1 - first_hit_frame) * eff_interval
-                        arrival_ts = now_utc - timedelta(minutes=arrival_min_ago)
-                        acc_store.observe(arrival_ts.isoformat(), "cluster_arrive",
-                                          key=str(cid), tag=cur_tag)
-                        acc_store.observed_cluster_arrivals.add(cid)
-                else:
-                    prev_raining_now = ca.raining_now
-
-                radar_int = None
-                px, py = calib.latlon_to_image_pixel(t_lat, t_lon)
-                xi, yi = int(round(px)), int(round(py))
-                if (last_mmh is not None and 0 <= yi < last_mmh.shape[0]
-                        and 0 <= xi < last_mmh.shape[1]):
-                    v = float(last_mmh[max(0, yi-1):yi+2, max(0, xi-1):xi+2].max())
-                    if v > 0: radar_int = v
-
-                nearest_cell = None
-                for i, (tr, a) in enumerate(zip(tracks, approaches)):
-                    if not approaching_flags[i]: continue
-                    clat, clon = calib.image_pixel_to_latlon(tr.cluster.cx, tr.cluster.cy)
-                    d = haversine_km(clat, clon, t_lat, t_lon)
-                    if nearest_cell is None or d < nearest_cell[0]:
-                        nearest_cell = (d, a.eta_min)
-
-                age_str = ""
-                if data_age_min is not None:
-                    if data_age_min > VERY_STALE_MIN:
-                        age_str = f" | radar {data_age_min:.0f} min ⚠⚠"
-                    elif data_age_min > STALE_MIN:
-                        age_str = f" | radar {data_age_min:.0f} min ⚠"
-                arch_str = f" | archived +{archived_now}" if archived_now > 0 else ""
-                print(f"\n=== {now_local.strftime('%H:%M:%S')} {tz_ab} | "
-                      f"cells:{len(tracks)} ({n_approaching} approaching) | "
-                      f"frames:{n_frames} | {ca.confidence}{age_str}{arch_str} | "
-                      f"rot:{view_rot_used:.0f}°{'(auto)' if view_rot_auto else ''} ===")
-                for line in nc.lines: print(line)
-                if lw.station_count > 0:
-                    wx_parts = [f"Local ({lw.station_count} st ≤{wx_radius:g}km):"]
-                    if lw.temp_c is not None: wx_parts.append(f"{lw.temp_c:.1f}°C")
-                    if lw.humidity_pct is not None: wx_parts.append(f"{lw.humidity_pct}%")
-                    if lw.pressure_hpa is not None: wx_parts.append(f"{lw.pressure_hpa:.1f}hPa")
-                    if lw.wind_speed_kmh is not None:
-                        w_s = f"wind {lw.wind_speed_kmh:.1f}km/h"
-                        if lw.wind_gust_kmh is not None:
-                            w_s += f" (gust {lw.wind_gust_kmh:.1f})"
-                        if lw.wind_dir_deg is not None:
-                            w_s += f" {lw.wind_dir_cardinal}/{lw.wind_dir_deg}°"
-                        wx_parts.append(w_s)
-                    if lw.precip_today_mm is not None:
-                        r_s = f"rain {lw.precip_today_mm:.1f}mm"
-                        if lw.rain_rate_mmh is not None and lw.rain_rate_mmh > 0:
-                            r_s += f" ({lw.rain_rate_mmh:.1f}mm/h)"
-                        wx_parts.append(r_s)
-                    print("  " + " | ".join(wx_parts))
-                if radar_int is not None:
-                    print(f"  Radar intensity at target: {radar_int:.1f} mm/h")
-                if ca.nearest_station:
-                    ns = ca.nearest_station
-                    print(f"  Nearest wet: {ns.reading.name} "
-                          f"({ns.dist_km:.1f} km, {ns.reading.precip_1h:.1f} mm/1h, {ns.trend})")
-                for i, (tr, a, tf) in enumerate(zip(tracks, approaches, threat_flags)):
-                    if not approaching_flags[i]: continue
-                    r_eff = rt["approaching_radius_km"] + a.cluster_radius_km * rt["cluster_radius_weight"]
-                    line = (f"  {cluster_label(i)} [{tr.cluster.size:4d}px "
-                            f"max={tr.cluster.max_mmh:4.1f}mm/h {tr.speed_kmh:4.1f}km/h]")
-                    if a.closest_km is not None:
-                        line += f" miss={a.closest_km:4.1f}/{r_eff:4.1f}km"
-                    if a.eta_min is not None:
-                        line += f" ETA={a.eta_min:4.0f}min"
-                    if tf: line += " ⚠ THREAT"
-                    print(line)
-
-                bm_key = (rt["basemap"], mapbox_style, mapbox_token, t_lat, t_lon,
-                          rt["radius_km"], view_rot_used, basemap_size)
-                if bm_key != cached_basemap_key:
-                    cached_basemap, cached_basemap_kind = resolve_basemap(rt, view_rot_used)
-                    cached_basemap_key = bm_key
-
-                png = gif = None
-                if web_enabled:
-                    try:
-                        header = (f"{target_name} | {ca.confidence} | "
-                                  f"{n_approaching} appr | {sum(threat_flags)} thr | "
-                                  f"{now_local.strftime('%H:%M %Z')} | "
-                                  f"rot {view_rot_used:.0f}°")
-                        png = render_composed_png(
-                            img, calib, t_lat, t_lon, rt["radius_km"],
-                            view_rot_used, basemap_size, cached_basemap,
-                            cached_basemap_kind,
-                            tracks, approaches, approaching_flags, threat_flags,
-                            all_stations, rt["show_cities"],
-                            intensity_mode, sri_legend, legend_mask,
-                            sri_thresholds, rt, confirm_mm=confirm_mm,
-                            header_text=header)
-                        gif = render_composed_gif(
-                            img, calib, t_lat, t_lon, rt["radius_km"],
-                            view_rot_used, basemap_size, cached_basemap,
-                            cached_basemap_kind,
-                            tracks, tracks_by_id, split_frames_by_id,
-                            eff_interval, approaches, approaching_flags,
-                            threat_flags, all_stations, rt["show_cities"],
-                            intensity_mode, sri_legend, legend_mask,
-                            sri_thresholds, rt, confirm_mm=confirm_mm)
-                    except Exception as e:
-                        print(f"  viz error: {e}", file=sys.stderr)
-
-                threat_keys_now = {tr.cid for tr, tf in zip(tracks, threat_flags) if tf}
-                if ha and threat_topic:
-                    for i, tr in enumerate(tracks):
-                        if tr.cid in (threat_keys_now - prev_threat_keys):
-                            a = approaches[i]
-                            r_eff = rt["threat_radius_km"] + a.cluster_radius_km * rt["cluster_radius_weight"]
-                            ha.publish_threat({
-                                "ts": now_iso, "cluster": cluster_label(i),
-                                "size_px": tr.cluster.size,
-                                "max_mmh": round(tr.cluster.max_mmh, 1),
-                                "mean_mmh": round(tr.cluster.mean_mmh, 1),
-                                "speed_kmh": round(tr.speed_kmh, 1),
-                                "eta_min": round(a.eta_min) if a.eta_min is not None else None,
-                                "miss_km": round(a.closest_km, 1) if a.closest_km is not None else None,
-                                "threat_radius_km": round(r_eff, 1),
-                                "approach_angle": round(a.approach_angle) if a.approach_angle is not None else None,
-                                "dist_km": round(a.dist_km, 1), "summary": nc.summary})
-                prev_threat_keys = threat_keys_now
-
-                ns = ca.nearest_station
-                if ca.confidence == "radar_only":
-                    summary_text = "[unconfirmed] " + nc.summary
-                elif ca.confidence == "station_only":
-                    summary_text = (f"[station-only] Rain at stations, radar dry. "
-                                    f"Radar next cell ~{nc.next_rain_eta_min:.0f} min."
-                                    if nc.next_rain_eta_min is not None
-                                    else "[station-only] Rain at stations, radar dry.")
-                elif ca.confidence == "dry" and ca.upstream_trend == "rising":
-                    summary_text = nc.summary + " Upstream stations rising."
-                elif ca.confidence == "dry" and ca.upstream_trend == "falling":
-                    summary_text = nc.summary + " Upstream stations weakening."
-                else:
-                    summary_text = nc.summary
-
-                nowcast_err_val = None
-                if acc_store and acc_store.enabled:
-                    ca_stat = acc_store.stats().get("by_kind", {}).get("cluster_arrive", {})
-                    if ca_stat.get("median_abs_error_min") is not None:
-                        nowcast_err_val = round(ca_stat["median_abs_error_min"])
-
-                sensor_values = {
-                    "raining_now": ca.raining_now, "raining_confirmed": ca.confirmed,
-                    "rain_confidence": ca.confidence,
-                    "rain_duration_min": (round(nc.rain_duration_min)
-                                          if nc.rain_duration_min is not None else 0),
-                    "rain_end_eta_min": (round(nc.rain_end_eta_min)
-                                         if nc.rain_end_eta_min is not None else None),
-                    "next_rain_eta_min": (round(nc.next_rain_eta_min)
-                                          if nc.next_rain_eta_min is not None else None),
-                    "gap_min": round(nc.gap_min) if nc.gap_min is not None else None,
-                    "summary": summary_text,
-                    "data_age_min": round(data_age_min, 1) if data_age_min is not None else None,
-                    "frame_timestamp": frame_ts_utc, "cell_count": n_approaching,
-                    "nearest_cell_km": round(nearest_cell[0], 1) if nearest_cell else None,
-                    "nearest_cell_eta_min": (round(nearest_cell[1])
-                                             if nearest_cell and nearest_cell[1] is not None else None),
-                    "radar_intensity_mmh": round(radar_int, 1) if radar_int is not None else None,
-                    "nearest_station_mm": round(ns.reading.precip_1h, 1) if ns else None,
-                    "nearest_station_km": round(ns.dist_km, 1) if ns else None,
-                    "nearest_station_age_min": (round(ns.age_min, 1)
-                                                if ns and ns.age_min is not None else None),
-                    "intensity_mmh": round(ca.intensity_mmh, 1) if ca.intensity_mmh is not None else None,
-                    "station_trend": ca.station_trend if ca.station_trend != "none" else None,
-                    "upstream_trend": ca.upstream_trend if ca.upstream_trend != "none" else None,
-                    "local_temp_c": lw.temp_c,
-                    "local_humidity": lw.humidity_pct,
-                    "local_pressure_hpa": lw.pressure_hpa,
-                    "local_wind_speed_kmh": lw.wind_speed_kmh,
-                    "local_wind_gust_kmh": lw.wind_gust_kmh,
-                    "local_wind_dir_deg": lw.wind_dir_deg,
-                    "local_wind_dir": lw.wind_dir_cardinal,
-                    "local_rain_today_mm": lw.precip_today_mm,
-                    "local_rain_1h_mm": lw.precip_1h_mm,
-                    "local_rain_rate_mmh": lw.rain_rate_mmh,
-                    "local_weather_stations": lw.station_count,
-                    "station_count_wet": ca.station_count_wet,
-                    "station_count_fresh": ca.station_count_fresh,
-                    "station_wet_fraction": (round(ca.wet_fraction * 100)
-                                             if ca.wet_fraction is not None else None),
-                    "station_median_mm": (round(ca.station_median_mm, 1)
-                                          if ca.station_median_mm is not None else None),
-                    "coverage_map": "ok" if png else "disabled",
-                    "nowcast_error_min": nowcast_err_val,
-                }
-                if ha: ha.publish_states(sensor_values)
-
-                if web_enabled:
-                    status_sensors = {}
-                    for k, v in sensor_values.items():
-                        status_sensors[k] = v.isoformat() if isinstance(v, datetime) else v
-                    threat_list = []
-                    for i, (tr, a, tf) in enumerate(zip(tracks, approaches, threat_flags)):
-                        if not tf: continue
-                        r_eff = rt["threat_radius_km"] + a.cluster_radius_km * rt["cluster_radius_weight"]
-                        threat_list.append({"label": cluster_label(i),
-                                            "size_px": tr.cluster.size,
-                                            "max_mmh": round(tr.cluster.max_mmh, 1),
-                                            "mean_mmh": round(tr.cluster.mean_mmh, 1),
-                                            "speed_kmh": round(tr.speed_kmh, 1),
-                                            "miss_km": (round(a.closest_km, 1)
-                                                        if a.closest_km is not None else None),
-                                            "threat_radius_km": round(r_eff, 1),
-                                            "eta_min": (round(a.eta_min)
-                                                        if a.eta_min is not None else None)})
-                    local_weather_dict = {
-                        "radius_km": lw.radius_km,
-                        "station_count": lw.station_count,
-                        "nearest_station": lw.nearest_station,
-                        "nearest_dist_km": lw.nearest_dist_km,
-                        "temp_c": lw.temp_c,
-                        "temp_trend": lw.temp_trend,
-                        "humidity_pct": lw.humidity_pct,
-                        "pressure_hpa": lw.pressure_hpa,
-                        "pressure_trend": lw.pressure_trend,
-                        "wind_speed_kmh": lw.wind_speed_kmh,
-                        "wind_gust_kmh": lw.wind_gust_kmh,
-                        "wind_dir_deg": lw.wind_dir_deg,
-                        "wind_dir_cardinal": lw.wind_dir_cardinal,
-                        "precip_today_mm": lw.precip_today_mm,
-                        "precip_1h_mm": lw.precip_1h_mm,
-                        "precip_6h_mm": lw.precip_6h_mm,
-                        "precip_24h_mm": lw.precip_24h_mm,
-                        "rain_rate_mmh": lw.rain_rate_mmh,
-                    }
-                    status = {
-                        "updated": now_iso, "target": target_name,
-                        "confidence": ca.confidence, "raining_now": ca.raining_now,
-                        "approaching_count": n_approaching,
-                        "threat_count": sum(threat_flags),
-                        "threats": threat_list,
-                        "local_weather": local_weather_dict,
-                        "archive": archiver.summary() if archiver else {"enabled": False},
-                        "sensors": status_sensors,
-                        "view_rotation_auto": view_rot_auto,
-                        "view_rotation_used": view_rot_used,
-                        "basemap_used": cached_basemap_kind,
-                    }
-                    with _VIZ_STATE["lock"]:
-                        _VIZ_STATE["status"] = status
-                        if png is not None: _VIZ_STATE["png"] = png
-                        if gif is not None: _VIZ_STATE["gif"] = gif
-                        _VIZ_STATE["updated"] = now_iso
-
-            except Exception as e:
-                print(f"  fetch error: {e}", file=sys.stderr)
-
-            if once: return
-            cycle_start = time.monotonic()
-            while True:
-                if _FORCE_REFRESH.is_set():
-                    _FORCE_REFRESH.clear(); break
-                maybe_pljusak()
-                cur_poll = _snapshot()["poll_s"]
-                if time.monotonic() >= cycle_start + cur_poll: break
-                rem = (cycle_start + cur_poll) - time.monotonic()
-                try: time.sleep(max(0.5, min(rem, 5)))
-                except KeyboardInterrupt: return
-    finally:
-        if out_fh: out_fh.close()
-        if ha: ha.disconnect()
-
-
-def get_effective_rotation(rt, t_lat, t_lon):
-    if rt["view_rotation_auto"]:
-        rot, _ = compute_coast_rotation(t_lat, t_lon)
-        if rot is not None:
-            return True, rot
-        return True, rt["view_rotation"]
-    return False, rt["view_rotation"]
+    return False, float(rt["view_rotation"]) % 360.0
 
 
 # ----------------------------------------------------------------------------
-# CLI
+# Single cycle
 # ----------------------------------------------------------------------------
-def parse_region(s):
+def run_once(calib, target_name, target_lat, target_lon, interval_min,
+             auto_interval, ts_region, ts_enabled, ts_tz, ts_source,
+             display_tz, intensity_mode, sri_legend, legend_mask,
+             sri_thresholds, pljusak, pljusak_interval,
+             confirm_radius, confirm_mm, confirm_age, confirm_frac, confirm_min_count,
+             prev_rain_state, publisher, web_enabled,
+             acc_store, data_dir, archiver=None):
+    rt = _snapshot()
+    static_cfg = _static_snapshot()
+    now_utc = datetime.now(timezone.utc)
+    img = fetch_image(GIF_URL)
+
+    last_frame_ts = None; raw_ocr = ""; ts_frame_idx = 0
+    if ts_enabled and ts_region is not None:
+        last_frame_ts, raw_ocr, ts_frame_idx = read_frame_timestamp(
+            img, ts_region, ts_tz, source=ts_source)
+    data_age_min = None; stale_status = "unknown"
+    if last_frame_ts is not None:
+        data_age_min = (now_utc - last_frame_ts).total_seconds() / 60.0
+        stale_status = ("very_stale" if data_age_min > VERY_STALE_MIN else
+                        "stale" if data_age_min > STALE_MIN else "fresh")
+
+    if sri_legend and not sri_legend.is_ready():
+        try:
+            img.seek(max(0, getattr(img, "n_frames", 1) - 1))
+            sri_legend.calibrate(img.convert("RGB"))
+            img.seek(0)
+            sri_legend.print_samples()
+        except Exception as e:
+            print(f"SRI legend calibration failed: {e}", file=sys.stderr)
+
+    (last_mask, last_mmh, raw_tracks, n_frames, rain_history,
+     label_array, tracks_by_id, split_frames_by_id,
+     cluster_first_target_hit, frame_masks_mmh) = track_animation(
+        img, calib, interval_min, target_lat, target_lon,
+        intensity_mode, sri_legend, legend_mask, rt=rt)
+
+    eff_interval = interval_min
+    if auto_interval and n_frames > 1:
+        eff_interval = 60.0 / (n_frames - 1)
+
+    tracks = [t for t in raw_tracks
+              if t.n_observations >= min(rt["min_duration_frames"], n_frames)
+              and t.cluster.size >= rt["min_size_px"]]
+    approaches = [assess(t, target_lat, target_lon, calib) for t in tracks]
+    approaching_flags = [refine_approaching(t, a, rt) for t, a in zip(tracks, approaches)]
+    threat_flags = [refine_threat(t, a, rt) for t, a in zip(tracks, approaches)]
+
+    nc = compute_nowcast(calib, target_lat, target_lon, tracks, approaches,
+                         rain_history, label_array, eff_interval, rt)
+
+    if pljusak is not None:
+        if (pljusak.last_fetch_utc is None
+                or (now_utc - pljusak.last_fetch_utc).total_seconds() >= pljusak_interval):
+            pljusak.fetch(now_utc)
+        all_stations = pljusak.get_all_stations(target_lat, target_lon, display_tz)
+        stations = [s for s in all_stations if s.dist_km <= confirm_radius]
+        local_wx = summarize_local_weather(
+            all_stations,
+            radius_km=float(rt.get("weather_radius_km", 5.0)),
+            max_age_min=confirm_age,
+        )
+    else:
+        all_stations = []
+        stations = []
+        local_wx = LocalWeather(radius_km=float(rt.get("weather_radius_km", 5.0)))
+
+    ca = combine_analysis(nc.raining_now, stations, tracks, approaches, calib,
+                          target_lat, target_lon, confirm_radius, confirm_mm,
+                          confirm_age, confirm_frac, confirm_min_count, rt)
+
+    if archiver is not None:
+        saved_cnt = archiver.process_animation(
+            img, frame_masks_mmh, last_frame_ts, eff_interval, now_utc, rt,
+            local_weather=local_wx, target_raining=ca.raining_now)
+        if saved_cnt > 0:
+            print(f"archive: saved {saved_cnt} storm frame(s) -> {archiver.last_episode_id}")
+
+    px, py = calib.latlon_to_image_pixel(target_lat, target_lon)
+    xi, yi = int(round(px)), int(round(py))
+    radar_mmh = 0.0
+    if last_mmh is not None and 0 <= yi < last_mmh.shape[0] and 0 <= xi < last_mmh.shape[1]:
+        radar_mmh = float(last_mmh[yi, xi])
+
+    if acc_store and acc_store.enabled:
+        now_iso = now_utc.isoformat()
+        tag = rt.get("settings_tag", "")
+        rt_snap = {k: rt[k] for k in (
+            "approaching_radius_km", "cluster_radius_weight", "only_approach_deg",
+            "threat_radius_km", "threat_angle_deg", "threat_min_duration",
+            "threat_min_sri_mmh", "velocity_window_min", "velocity_adaptive")}
+        if ca.raining_now and not prev_rain_state:
+            acc_store.observe(now_iso, "rain_start", key="target", tag=tag)
+        if not ca.raining_now and prev_rain_state:
+            acc_store.observe(now_iso, "rain_end", key="target", tag=tag)
+        if not ca.raining_now and nc.next_rain_eta_min is not None:
+            acc_store.predict(now_iso, "rain_start", nc.next_rain_eta_min,
+                              key="target", tag=tag, settings=rt_snap,
+                              horizon_min=nc.next_rain_eta_min)
+        if ca.raining_now and nc.rain_end_eta_min is not None:
+            acc_store.predict(now_iso, "rain_end", nc.rain_end_eta_min,
+                              key="target", tag=tag, settings=rt_snap,
+                              horizon_min=nc.rain_end_eta_min)
+        for cid, hit_frame in cluster_first_target_hit.items():
+            obs = tracks_by_id.get(cid, [])
+            first_f = obs[0][0] if obs else 0
+            key = f"{first_f}:{cid}"
+            if key in acc_store.observed_cluster_arrivals: continue
+            acc_store.observed_cluster_arrivals.add(key)
+            if len(acc_store.observed_cluster_arrivals) > 500:
+                acc_store.observed_cluster_arrivals.clear()
+            acc_store.observe(now_iso, "cluster_arrive", key=key, tag=tag,
+                              extra={"cid": cid, "hit_frame": hit_frame})
+        for tr, a, af, tf in zip(tracks, approaches, approaching_flags, threat_flags):
+            if not af or a.eta_min is None: continue
+            obs = tracks_by_id.get(tr.cid, [])
+            first_f = obs[0][0] if obs else 0
+            key = f"{first_f}:{tr.cid}"
+            acc_store.predict(now_iso, "cluster_arrive", a.eta_min,
+                              key=key, tag=tag, settings=rt_snap, horizon_min=a.eta_min)
+            if tf:
+                acc_store.predict(now_iso, "threat", a.eta_min,
+                                  key=key, tag=tag, settings=rt_snap, horizon_min=a.eta_min)
+
+    nc_err = None
+    if acc_store and acc_store.enabled:
+        st = acc_store.stats()
+        errs = [s["median_abs_error_min"] for s in st["by_kind"].values()
+                if s.get("median_abs_error_min") is not None]
+        if errs: nc_err = round(float(np.median(errs)), 1)
+
+    approaching_items = [(tr, a) for tr, a, af in zip(tracks, approaches, approaching_flags) if af]
+    threat_items = [(tr, a) for tr, a, tf in zip(tracks, approaches, threat_flags) if tf]
+    approaching_items.sort(key=lambda x: x[1].eta_min if x[1].eta_min is not None else 9999)
+    threat_items.sort(key=lambda x: x[1].eta_min if x[1].eta_min is not None else 9999)
+
+    nearest_cell_km = nearest_cell_eta = None
+    if approaching_items:
+        _, na = approaching_items[0]
+        nearest_cell_km = round(na.dist_km, 1)
+        nearest_cell_eta = round(na.eta_min, 0) if na.eta_min is not None else None
+
+    nearest_st_mm = nearest_st_km = nearest_st_age = None
+    if ca.nearest_station:
+        ns = ca.nearest_station
+        nearest_st_mm = round(ns.reading.precip_1h, 1)
+        nearest_st_km = round(ns.dist_km, 1)
+        nearest_st_age = round(ns.age_min, 0) if ns.age_min is not None else None
+
+    values = {
+        "raining_now": ca.raining_now, "raining_confirmed": ca.confirmed,
+        "rain_confidence": ca.confidence,
+        "rain_duration_min": round(nc.rain_duration_min, 0) if nc.rain_duration_min is not None else None,
+        "rain_end_eta_min": round(nc.rain_end_eta_min, 0) if nc.rain_end_eta_min is not None else None,
+        "next_rain_eta_min": round(nc.next_rain_eta_min, 0) if nc.next_rain_eta_min is not None else None,
+        "gap_min": round(nc.gap_min, 0) if nc.gap_min is not None else None,
+        "summary": nc.summary,
+        "radar_intensity_mmh": round(radar_mmh, 1),
+        "nearest_station_mm": nearest_st_mm,
+        "intensity_mmh": round(ca.intensity_mmh, 1) if ca.intensity_mmh is not None else None,
+        "station_trend": ca.station_trend, "upstream_trend": ca.upstream_trend,
+        "local_temp_c": local_wx.temp_c,
+        "local_humidity": local_wx.humidity_pct,
+        "local_pressure_hpa": local_wx.pressure_hpa,
+        "local_wind_speed_kmh": local_wx.wind_speed_kmh,
+        "local_wind_gust_kmh": local_wx.wind_gust_kmh,
+        "local_wind_dir_deg": local_wx.wind_dir_deg,
+        "local_wind_dir": local_wx.wind_dir_cardinal,
+        "local_rain_today_mm": local_wx.precip_today_mm,
+        "local_rain_1h_mm": local_wx.precip_1h_mm,
+        "local_rain_rate_mmh": local_wx.rain_rate_mmh,
+        "local_weather_stations": local_wx.station_count,
+        "coverage_map": "ready" if web_enabled else "disabled",
+        "nowcast_error_min": nc_err,
+        "data_age_min": round(data_age_min, 0) if data_age_min is not None else None,
+        "frame_timestamp": last_frame_ts.isoformat() if last_frame_ts else None,
+        "cell_count": len(approaching_items),
+        "nearest_cell_km": nearest_cell_km, "nearest_cell_eta_min": nearest_cell_eta,
+        "nearest_station_km": nearest_st_km, "nearest_station_age_min": nearest_st_age,
+        "station_count_wet": ca.station_count_wet, "station_count_fresh": ca.station_count_fresh,
+        "station_wet_fraction": round(ca.wet_fraction * 100, 0) if ca.wet_fraction is not None else None,
+        "station_median_mm": round(ca.station_median_mm, 1) if ca.station_median_mm is not None else None,
+    }
+    summary_attrs = {
+        "target": target_name,
+        "approaching_cells": [
+            {"label": cluster_label(i), "size_px": tr.cluster.size,
+             "max_mmh": round(tr.cluster.max_mmh, 1),
+             "dist_km": round(a.dist_km, 1), "speed_kmh": round(tr.speed_kmh, 0),
+             "eff_window_min": round(tr.eff_window_min, 1),
+             "miss_km": round(a.closest_km, 1) if a.closest_km is not None else None,
+             "eta_min": round(a.eta_min, 0) if a.eta_min is not None else None,
+             "threat": refine_threat(tr, a, rt)}
+            for i, (tr, a) in enumerate(approaching_items)],
+        "threats": [
+            {"label": cluster_label(i), "size_px": tr.cluster.size,
+             "max_mmh": round(tr.cluster.max_mmh, 1),
+             "dist_km": round(a.dist_km, 1),
+             "miss_km": round(a.closest_km, 1) if a.closest_km is not None else None,
+             "eta_min": round(a.eta_min, 0) if a.eta_min is not None else None}
+            for i, (tr, a) in enumerate(threat_items)],
+        "local_weather": {
+            "radius_km": local_wx.radius_km,
+            "station_count": local_wx.station_count,
+            "nearest_station": local_wx.nearest_station,
+            "nearest_dist_km": local_wx.nearest_dist_km,
+            "temp_c": local_wx.temp_c,
+            "temp_trend": local_wx.temp_trend,
+            "humidity_pct": local_wx.humidity_pct,
+            "pressure_hpa": local_wx.pressure_hpa,
+            "pressure_trend": local_wx.pressure_trend,
+            "wind_speed_kmh": local_wx.wind_speed_kmh,
+            "wind_gust_kmh": local_wx.wind_gust_kmh,
+            "wind_dir_deg": local_wx.wind_dir_deg,
+            "wind_dir_cardinal": local_wx.wind_dir_cardinal,
+            "precip_today_mm": local_wx.precip_today_mm,
+            "precip_1h_mm": local_wx.precip_1h_mm,
+            "precip_6h_mm": local_wx.precip_6h_mm,
+            "precip_24h_mm": local_wx.precip_24h_mm,
+            "rain_rate_mmh": local_wx.rain_rate_mmh,
+        },
+        "stale_status": stale_status,
+        "settings_tag": rt.get("settings_tag", ""),
+        "archive": archiver.summary() if archiver else {"enabled": False},
+    }
+
+    if publisher:
+        publisher.publish_states(values, summary_attrs=summary_attrs,
+                                 coverage_attrs={"image_url": "/threat.png",
+                                                 "gif_url": "/threat.gif"})
+        for i, (tr, a) in enumerate(threat_items):
+            publisher.publish_threat({
+                "label": cluster_label(i), "size_px": tr.cluster.size,
+                "max_mmh": round(tr.cluster.max_mmh, 1),
+                "dist_km": round(a.dist_km, 1),
+                "miss_km": round(a.closest_km, 1) if a.closest_km is not None else None,
+                "eta_min": round(a.eta_min, 0) if a.eta_min is not None else None,
+            })
+
+    basemap_kind = "greyscale"
+    basemap_img = None
+    mapbox_token = static_cfg.get("mapbox_token")
+    mapbox_style = static_cfg.get("mapbox_style") or "mapbox/satellite-v9"
+    size_px = static_cfg.get("basemap_size") or 640
+    bm_choice = rt.get("basemap", "auto")
+
+    north_up_bm = None
+    if rt.get("view_rotation_auto") and mapbox_token and bm_choice in ("auto", "mapbox"):
+        north_up_bm = fetch_basemap(
+            mapbox_style, mapbox_token, target_lat, target_lon,
+            rt["radius_km"], 0.0, size_px, data_dir)
+
+    view_rot_auto, view_rot_used = get_effective_rotation(
+        rt, target_lat, target_lon, basemap_north_up=north_up_bm)
+
+    if bm_choice == "mapbox" or (bm_choice == "auto" and mapbox_token):
+        if mapbox_token:
+            basemap_img = fetch_basemap(
+                mapbox_style, mapbox_token, target_lat, target_lon,
+                rt["radius_km"], view_rot_used, size_px, data_dir)
+            if basemap_img is not None:
+                basemap_kind = "mapbox"
+    elif bm_choice == "none":
+        basemap_img = Image.new("RGB", (size_px, size_px), (18, 22, 28))
+        basemap_kind = "none"
+
+    if web_enabled:
+        ts_label = last_frame_ts.astimezone(display_tz).strftime("%Y-%m-%d %H:%M %Z") if last_frame_ts else None
+        header_txt = f"DHMZ SRI Radar  |  {ts_label}" if ts_label else "DHMZ SRI Radar"
+        try:
+            png = render_composed_png(
+                img, calib, target_lat, target_lon, rt["radius_km"],
+                view_rot_used, size_px, basemap_img, basemap_kind,
+                tracks, approaches, approaching_flags, threat_flags,
+                all_stations, rt["show_cities"],
+                intensity_mode, sri_legend, legend_mask, sri_thresholds, rt,
+                confirm_mm=confirm_mm, header_text=header_txt)
+        except Exception as e:
+            print(f"PNG render error: {e}", file=sys.stderr)
+            png = None
+        try:
+            gif = render_composed_gif(
+                img, calib, target_lat, target_lon, rt["radius_km"],
+                view_rot_used, size_px, basemap_img, basemap_kind,
+                tracks, tracks_by_id, split_frames_by_id, eff_interval,
+                approaches, approaching_flags, threat_flags,
+                all_stations, rt["show_cities"],
+                intensity_mode, sri_legend, legend_mask, sri_thresholds, rt,
+                confirm_mm=confirm_mm)
+        except Exception as e:
+            print(f"GIF render error: {e}", file=sys.stderr)
+            gif = None
+        with _VIZ_STATE["lock"]:
+            _VIZ_STATE["png"] = png
+            _VIZ_STATE["gif"] = gif
+            _VIZ_STATE["updated"] = now_utc.astimezone(display_tz).isoformat(timespec="seconds")
+            _VIZ_STATE["status"] = {
+                "target": target_name,
+                "updated": _VIZ_STATE["updated"],
+                "confidence": ca.confidence,
+                "raining_now": ca.raining_now,
+                "approaching_count": len(approaching_items),
+                "threat_count": len(threat_items),
+                "threats": summary_attrs["threats"],
+                "local_weather": summary_attrs["local_weather"],
+                "archive": summary_attrs["archive"],
+                "sensors": values,
+                "view_rotation_used": view_rot_used,
+                "view_rotation_auto": view_rot_auto,
+                "basemap_used": basemap_kind,
+            }
+
+    return ca.raining_now
+
+
+# ----------------------------------------------------------------------------
+# CLI + main
+# ----------------------------------------------------------------------------
+def _parse_region(s):
     if not s: return None
     parts = [int(p.strip()) for p in s.split(",")]
-    if len(parts) != 4: raise ValueError("region must be 'x0,y0,x1,y1'")
+    if len(parts) != 4: raise ValueError(f"--timestamp-region '{s}': need x0,y0,x1,y1")
     return tuple(parts)
 
 
-def parse_floats(s):
-    if not s: return None
-    return tuple(float(x.strip()) for x in s.split(","))
-
-
-def parse_sri_breaks(s):
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-    if not parts: raise ValueError("empty break list")
-    has_at = ["@" in p for p in parts]
-    if all(has_at):
-        vals, poss = [], []
-        for p in parts:
-            v, pos = p.split("@", 1)
-            vals.append(float(v)); poss.append(float(pos))
-        if any(p < 0 or p > 1 for p in poss):
-            raise ValueError("positions must be in [0, 1]")
-        if poss != sorted(poss): raise ValueError("positions must be sorted ascending")
-        return vals, poss
-    if not any(has_at): return [float(p) for p in parts], None
-    raise ValueError("either all or none of --sri-breaks must use @position")
-
-
 def main():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--location", type=str, default=None)
+    p = argparse.ArgumentParser(description="DHMZ radar + pljusak tracker + offline shadow tuner")
+    p.add_argument("--data-dir", default="/data")
+    p.add_argument("--offline-gui", action="store_true",
+                   help="Run ONLY the web server for offline replay & shadow tuning (no live DHMZ/Pljusak polling)")
+    p.add_argument("--location", default=None)
     p.add_argument("--lat", type=float, default=None)
     p.add_argument("--lon", type=float, default=None)
-    p.add_argument("--data-dir", type=str, default=None)
-    p.add_argument("--calibration", type=str, default=None)
-    p.add_argument("--calibration-inline", type=str, default=None)
-    p.add_argument("--help-calibration", action="store_true", default=False)
-    p.add_argument("--radar-intensity", choices=["simple", "decoded"], default=None)
-    p.add_argument("--sri-legend-region", type=str, default=None)
-    p.add_argument("--sri-legend-orientation", choices=["horizontal", "vertical"], default=None)
-    p.add_argument("--sri-legend-padding", type=int, default=None)
-    p.add_argument("--sri-breaks", type=str, default=None)
-    p.add_argument("--sri-thresholds", type=str, default=None)
-    p.add_argument("--frame-interval-min", type=float, default=None)
-    p.add_argument("--auto-frame-interval", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--timestamp-region", type=str, default=None)
-    p.add_argument("--timestamp", dest="timestamp_enabled",
-                   action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--timestamp-tz", type=str, default=None)
-    p.add_argument("--timestamp-source", choices=["first", "last"], default=None)
-    p.add_argument("--display-tz", type=str, default=None)
-    p.add_argument("--no-cities", dest="cities", action="store_false", default=None)
+    p.add_argument("--calibration", default=None)
+    p.add_argument("--calibration-inline", default=None)
     p.add_argument("--radius", type=float, default=None)
     p.add_argument("--weather-radius", type=float, default=None)
-    p.add_argument("--archive", dest="archive_enabled",
-                   action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--archive-radius", type=float, default=None)
     p.add_argument("--archive-min-pixels", type=int, default=None)
-    p.add_argument("--poll", type=int, default=None)
-    p.add_argument("--min-duration", type=int, default=None)
-    p.add_argument("--min-size", type=int, default=None)
+    p.add_argument("--archive-enabled", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--approaching-radius", type=float, default=None)
     p.add_argument("--cluster-radius-weight", type=float, default=None)
     p.add_argument("--only-approach", type=float, default=None)
@@ -4016,214 +4913,184 @@ def main():
     p.add_argument("--threat-angle", type=float, default=None)
     p.add_argument("--threat-min-duration", type=int, default=None)
     p.add_argument("--threat-min-sri", type=float, default=None)
-    p.add_argument("--view-rotation-auto", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--view-rotation", type=float, default=None)
-    p.add_argument("--basemap", choices=["auto", "mapbox", "greyscale", "none"], default=None)
-    p.add_argument("--basemap-saturation", type=float, default=None)
-    p.add_argument("--basemap-brightness", type=float, default=None)
-    p.add_argument("--basemap-contrast", type=float, default=None)
-    p.add_argument("--mapbox-token", type=str, default=None)
-    p.add_argument("--mapbox-style", type=str, default=None)
-    p.add_argument("--basemap-size", type=int, default=None)
-    p.add_argument("--pljusak", dest="pljusak_enabled",
-                   action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--pljusak-url", type=str, default=None)
+    p.add_argument("--min-duration", type=int, default=None)
+    p.add_argument("--min-size", type=int, default=None)
+    p.add_argument("--velocity-window", type=float, default=None)
+    p.add_argument("--velocity-adaptive", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--radar-intensity", choices=["simple", "sri"], default=None)
+    p.add_argument("--sri-legend-region", default=None)
+    p.add_argument("--sri-legend-orientation",
+                   choices=["horizontal", "vertical"], default=None)
+    p.add_argument("--sri-legend-padding", type=int, default=None)
+    p.add_argument("--sri-breaks", default=None)
+    p.add_argument("--sri-thresholds", default=None)
+    p.add_argument("--frame-interval-min", type=float, default=None)
+    p.add_argument("--timestamp-region", default=None)
+    p.add_argument("--timestamp-enabled", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--timestamp-tz", default=None)
+    p.add_argument("--timestamp-source", choices=["first", "last"], default=None)
+    p.add_argument("--display-tz", default=None)
+    p.add_argument("--pljusak-enabled", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--pljusak-url", default=None)
     p.add_argument("--pljusak-interval", type=int, default=None)
     p.add_argument("--station-confirm-radius", type=float, default=None)
     p.add_argument("--station-confirm-min-mm", type=float, default=None)
     p.add_argument("--station-confirm-max-age-min", type=float, default=None)
     p.add_argument("--station-confirm-fraction", type=float, default=None)
     p.add_argument("--station-confirm-min-count", type=int, default=None)
-    p.add_argument("--mqtt", dest="mqtt_enabled",
-                   action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--mqtt-host", type=str, default=None)
-    p.add_argument("--mqtt-port", type=int, default=None)
-    p.add_argument("--mqtt-tls", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--ha-discovery-prefix", type=str, default=None)
-    p.add_argument("--ha-state-prefix", type=str, default=None)
-    p.add_argument("--ha-device-id", type=str, default=None)
-    p.add_argument("--ha-device-name", type=str, default=None)
-    p.add_argument("--ha-sensors", type=str, default=None)
-    p.add_argument("--mqtt-no-retain", action="store_true", default=None)
-    p.add_argument("--ha-threat-topic", type=str, default=None)
-    p.add_argument("--web", dest="web_enabled",
-                   action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--web-enabled", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--web-port", type=int, default=None)
     p.add_argument("--web-scale", type=float, default=None)
-    p.add_argument("--accuracy", dest="accuracy_enabled",
-                   action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--once", action="store_true", default=False)
-    p.add_argument("--dump-jsonl", type=str, default=None)
-    p.add_argument("--settings-tag", type=str, default=None)
-
+    p.add_argument("--view-rotation", type=float, default=None)
+    p.add_argument("--view-rotation-auto", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--basemap", choices=["auto", "mapbox", "greyscale", "none"], default=None)
+    p.add_argument("--basemap-saturation", type=float, default=None)
+    p.add_argument("--basemap-brightness", type=float, default=None)
+    p.add_argument("--basemap-contrast", type=float, default=None)
+    p.add_argument("--cities", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--settings-tag", default=None)
+    p.add_argument("--mapbox-token", default=None)
+    p.add_argument("--mapbox-style", default=None)
+    p.add_argument("--basemap-size", type=int, default=None)
+    p.add_argument("--mqtt-enabled", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--mqtt-host", default=None)
+    p.add_argument("--mqtt-port", type=int, default=None)
+    p.add_argument("--mqtt-tls", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--ha-discovery-prefix", default=None)
+    p.add_argument("--ha-state-prefix", default=None)
+    p.add_argument("--ha-device-id", default=None)
+    p.add_argument("--ha-device-name", default=None)
+    p.add_argument("--ha-sensors", default=None)
+    p.add_argument("--mqtt-no-retain", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--ha-threat-topic", default=None)
+    p.add_argument("--poll", type=int, default=None)
+    p.add_argument("--jsonl-dump", default=None)
+    p.add_argument("--accuracy-enabled", action=argparse.BooleanOptionalAction, default=None)
     args = p.parse_args()
 
-    if args.help_calibration:
-        print("Default calibration:\n" + DEFAULT_CALIBRATION_JSON); return
-
-    data_dir = args.data_dir or os.environ.get("DATA_DIR") or "/data"
-    try:
-        os.makedirs(data_dir, exist_ok=True)
-    except OSError as e:
-        print(f"WARNING: cannot create {data_dir}: {e} — persistence disabled",
-              file=sys.stderr)
-        data_dir = None
-    config_path = os.path.join(data_dir, "config.json") if data_dir else None
-
-    existing = _load_json_file(config_path) if config_path else None
-    runtime, static = _merge_config(args, existing)
-
-    if config_path:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        merged = {"version": 1,
-                  "created_at": (existing or {}).get("created_at", now_iso),
-                  "updated_at": now_iso,
-                  "runtime": runtime, "static": static}
-        _save_json_file(config_path, merged)
-        print(f"Config {'created' if existing is None else 'loaded'} at {config_path}")
-
-    with _RUNTIME_LOCK: _RUNTIME.update(runtime)
+    config_path = os.path.join(args.data_dir, "config.json") if args.data_dir else None
+    existing_cfg = _load_json_file(config_path)
+    runtime, static = _merge_config(args, existing_cfg)
+    with _RUNTIME_LOCK:
+        _RUNTIME.update(runtime)
     _apply_static(static)
+    if config_path and existing_cfg is None:
+        now = datetime.now(timezone.utc).isoformat()
+        _save_json_file(config_path, {"version": 1, "created_at": now,
+                                       "updated_at": now, "runtime": runtime,
+                                       "static": static})
     _VIZ_STATE["config_path"] = config_path
+    _VIZ_STATE["data_dir"] = args.data_dir
 
-    if static.get("location"):
-        c = resolve_city(static["location"])
-        if not c:
-            print(f"ERROR: unknown city '{static['location']}'", file=sys.stderr); sys.exit(2)
-        target_name, t_lat, t_lon = c
-    elif static.get("lat") is not None and static.get("lon") is not None:
-        target_name = f"{static['lat']:.4f},{static['lon']:.4f}"
-        t_lat, t_lon = static["lat"], static["lon"]
+    if static["location"]:
+        resolved = resolve_city(static["location"])
+        if not resolved:
+            print(f"error: unknown location '{static['location']}'", file=sys.stderr)
+            sys.exit(2)
+        target_name, target_lat, target_lon = resolved
+    elif static["lat"] is not None and static["lon"] is not None:
+        target_lat, target_lon = static["lat"], static["lon"]
+        target_name = f"{target_lat:.4f},{target_lon:.4f}"
     else:
-        print("ERROR: no target — pass --location or --lat/--lon", file=sys.stderr); sys.exit(2)
+        print("error: specify --location or --lat/--lon (or persist in config.json)",
+              file=sys.stderr)
+        sys.exit(2)
 
-    try:
-        probe = fetch_image(GIF_URL); image_size = probe.size
-    except Exception as e:
-        print(f"ERROR probing image: {e}", file=sys.stderr); sys.exit(2)
-    calib_inline = static.get("calibration_inline") or DEFAULT_CALIBRATION_JSON
-    try:
-        calib = load_calibration(static.get("calibration"), calib_inline, image_size=image_size)
-    except Exception as e:
-        print(f"ERROR loading calibration: {e}", file=sys.stderr); sys.exit(2)
+    calib = load_calibration(static["calibration"], static["calibration_inline"],
+                             image_size=(720, 720))
 
-    px, py = calib.latlon_to_image_pixel(t_lat, t_lon)
-    check_lat, check_lon = calib.image_pixel_to_latlon(px, py)
-    check_dist_km = haversine_km(t_lat, t_lon, check_lat, check_lon)
-    if check_dist_km > 5.0:
-        print(f"WARNING: target maps to ({check_lat:.3f},{check_lon:.3f}), "
-              f"{check_dist_km:.1f} km from intended ({t_lat:.3f},{t_lon:.3f}) — "
-              f"check calibration if unexpected", file=sys.stderr)
+    display_tz, _ = get_zoneinfo(static["display_tz"])
+    ts_tz = get_zoneinfo(static["timestamp_tz"])[0] if static["timestamp_tz"] else display_tz
+    ts_region = _parse_region(static["timestamp_region"])
 
     sri_legend = None
-    sri_thresholds = parse_floats(static.get("sri_thresholds")) or DEFAULT_SRI_THRESHOLDS
-    if static.get("radar_intensity") == "decoded":
-        if not static.get("sri_legend_region"):
-            print("ERROR: --radar-intensity decoded requires --sri-legend-region",
-                  file=sys.stderr); sys.exit(2)
-        try:
-            region = parse_region(static["sri_legend_region"])
-        except ValueError as e:
-            print(f"ERROR parsing sri-legend-region: {e}", file=sys.stderr); sys.exit(2)
-        if static.get("sri_breaks"):
-            try: break_values, break_positions = parse_sri_breaks(static["sri_breaks"])
-            except ValueError as e:
-                print(f"ERROR parsing sri-breaks: {e}", file=sys.stderr); sys.exit(2)
-        else:
-            print("ERROR: --radar-intensity decoded requires --sri-breaks.",
-                  file=sys.stderr); sys.exit(2)
-        sri_legend = SRILegend(region,
-                               orientation=static.get("sri_legend_orientation") or "horizontal",
-                               breaks=break_values,
-                               break_positions=break_positions,
-                               padding_px=static.get("sri_legend_padding") or 1)
+    legend_mask = None
+    if static["radar_intensity"] == "sri":
+        if not static["sri_legend_region"] or not static["sri_breaks"]:
+            print("error: --radar-intensity sri requires --sri-legend-region and --sri-breaks",
+                  file=sys.stderr)
+            sys.exit(2)
+        reg = _parse_region(static["sri_legend_region"])
+        breaks = [float(b.strip()) for b in static["sri_breaks"].split(",") if b.strip()]
+        sri_legend = SRILegend(reg, orientation=static["sri_legend_orientation"],
+                               breaks=breaks, padding_px=static["sri_legend_padding"])
+        legend_mask = np.zeros((720, 720), dtype=bool)
+        legend_mask[reg[1]:reg[3], reg[0]:reg[2]] = True
 
-    display_tz, display_tz_name = get_zoneinfo(static.get("display_tz"))
-    timestamp_tz, _ = get_zoneinfo(static.get("timestamp_tz") or display_tz_name)
+    sri_thresholds = DEFAULT_SRI_THRESHOLDS
+    if static["sri_thresholds"]:
+        parts = [float(x.strip()) for x in static["sri_thresholds"].split(",") if x.strip()]
+        if len(parts) == 3:
+            sri_thresholds = tuple(parts)
 
-    timestamp_region = None
-    if static.get("timestamp_enabled", True):
-        try:
-            timestamp_region = parse_region(static.get("timestamp_region") or DEFAULT_TIMESTAMP_REGION_STR)
-        except ValueError as e:
-            print(f"ERROR parsing timestamp-region: {e}", file=sys.stderr); sys.exit(2)
-        if not HAVE_TESSERACT:
-            print("WARNING: pytesseract not installed; timestamp OCR disabled.", file=sys.stderr)
-            timestamp_region = None
-
-    pljusak = PljusakClient(url=static.get("pljusak_url") or PLJUSAK_URL) \
-        if static.get("pljusak_enabled", True) else None
-
-    mqtt_host = static.get("mqtt_host") or os.environ.get("MQTT_HOST")
-    mqtt_user = os.environ.get("MQTT_USER"); mqtt_pass = os.environ.get("MQTT_PASS")
-    ha = None
-    if mqtt_host and static.get("mqtt_enabled", True):
-        if not HAVE_MQTT:
-            print("WARNING: MQTT_HOST set but paho-mqtt not installed.", file=sys.stderr)
-        else:
-            sensors = parse_sensor_list(static.get("mqtt_sensors") or "all")
-            device_id = static.get("mqtt_device_id") or \
-                f"dhmz_{target_name.lower().replace(' ', '_').replace(',', '')}"
-            mark_offline = (static.get("mqtt_mark_offline")
-                            if static.get("mqtt_mark_offline") is not None
-                            else not args.once)
-            ha = HAPublisher(mqtt_host, static.get("mqtt_port") or 1883,
-                             mqtt_user, mqtt_pass, bool(static.get("mqtt_tls")),
-                             static.get("mqtt_discovery_prefix") or "homeassistant",
-                             static.get("mqtt_state_prefix") or "dhmz_radar",
-                             device_id,
-                             static.get("mqtt_device_name") or "DHMZ Radar",
-                             target_name, sensors, mark_offline,
-                             not bool(static.get("mqtt_no_retain")),
-                             static.get("mqtt_threat_topic"))
-            ha.connect()
-
-    acc_store = None
-    if data_dir and static.get("accuracy_enabled", True):
-        try:
-            acc_store = AccuracyStore(data_dir)
-            if not acc_store.enabled: acc_store = None
-        except Exception as e:
-            print(f"WARNING: accuracy init failed: {e}", file=sys.stderr)
+    acc_store = AccuracyStore(args.data_dir) if static["accuracy_enabled"] else None
     _VIZ_STATE["acc_store"] = acc_store
 
-    archiver = None
-    if data_dir:
-        try:
-            archiver = StormArchiver(data_dir, calib, t_lat, t_lon, target_name)
-        except Exception as e:
-            print(f"WARNING: archive init failed: {e}", file=sys.stderr)
+    archiver = StormArchiver(args.data_dir, calib, target_lat, target_lon, target_name) if args.data_dir else None
     _VIZ_STATE["archiver"] = archiver
 
-    web_enabled = bool(static.get("web_enabled", True))
-    web_port = static.get("web_port") or 8080
-    if web_enabled:
-        if args.once:
-            print("WARNING: --once with web port exits before browse.", file=sys.stderr)
-        try:
-            _start_web_server(web_port)
-            print(f"Web server on port {web_port}")
-        except OSError as e:
-            print(f"WARNING: web server failed: {e}", file=sys.stderr)
-            web_enabled = False
+    profile_store = ProfileStore(args.data_dir) if args.data_dir else None
+    if profile_store:
+        profile_store.ensure_baseline(_snapshot())
+    _VIZ_STATE["profile_store"] = profile_store
 
-    run(target_name, t_lat, t_lon, calib, args.once,
-        static.get("jsonl_dump"), static.get("frame_interval_min") or 5.0,
-        bool(static.get("auto_frame_interval")), timestamp_region,
-        static.get("timestamp_source") or "last", timestamp_tz,
-        display_tz, display_tz_name, ha, pljusak,
-        static.get("pljusak_interval") or 60,
-        static.get("radar_intensity") or "simple",
-        sri_legend, sri_thresholds,
-        static.get("station_confirm_radius") or 15.0,
-        static.get("station_confirm_min_mm") or 0.2,
-        static.get("station_confirm_max_age_min") or 15.0,
-        static.get("station_confirm_fraction") or 0.5,
-        static.get("station_confirm_min_count") or 1,
-        static.get("mqtt_threat_topic"), web_enabled, web_port,
-        acc_store, archiver, data_dir,
-        static.get("mapbox_token"), static.get("mapbox_style") or "mapbox/satellite-v9",
-        static.get("basemap_size") or 640)
+    replay_engine = OfflineReplayEngine(
+        archiver, calib, target_lat, target_lon,
+        static["frame_interval_min"], static["radar_intensity"], sri_legend)
+    _VIZ_STATE["replay_engine"] = replay_engine
+
+    if static["web_enabled"] or args.offline_gui:
+        _start_web_server(static["web_port"])
+        print(f"web: listening on :{static['web_port']} (live: /, offline tuner: /replay)")
+
+    if args.offline_gui:
+        print("offline-gui mode: live DHMZ/Pljusak polling disabled. Open /replay in browser.")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            return
+
+    pljusak = PljusakClient(url=static["pljusak_url"]) if static["pljusak_enabled"] else None
+
+    publisher = None
+    if static["mqtt_enabled"] and static["mqtt_host"]:
+        dev_id = static["mqtt_device_id"] or re.sub(r"[^a-z0-9_]", "_", target_name.lower())
+        enabled_keys = parse_sensor_list(static["mqtt_sensors"])
+        publisher = HAPublisher(
+            static["mqtt_host"], static["mqtt_port"],
+            os.environ.get("MQTT_USER"), os.environ.get("MQTT_PASSWORD"),
+            static["mqtt_tls"],
+            static["mqtt_discovery_prefix"], static["mqtt_state_prefix"],
+            dev_id, static["mqtt_device_name"],
+            enabled_keys, retain=not static["mqtt_no_retain"],
+            threat_topic=static["mqtt_threat_topic"],
+            web_port=static["web_port"] if static["web_enabled"] else None)
+
+    prev_rain_state = False
+    try:
+        while True:
+            try:
+                prev_rain_state = run_once(
+                    calib, target_name, target_lat, target_lon,
+                    static["frame_interval_min"], static["auto_frame_interval"],
+                    ts_region, static["timestamp_enabled"], ts_tz, static["timestamp_source"],
+                    display_tz, static["radar_intensity"], sri_legend, legend_mask,
+                    sri_thresholds, pljusak, static["pljusak_interval"],
+                    static["station_confirm_radius"], static["station_confirm_min_mm"],
+                    static["station_confirm_max_age_min"],
+                    static["station_confirm_fraction"], static["station_confirm_min_count"],
+                    prev_rain_state, publisher, static["web_enabled"],
+                    acc_store, args.data_dir, archiver=archiver)
+            except Exception as e:
+                print(f"cycle error: {e}", file=sys.stderr)
+            _FORCE_REFRESH.clear()
+            _FORCE_REFRESH.wait(timeout=_snapshot()["poll_s"])
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if publisher:
+            publisher.close(mark_offline=True)
 
 
 if __name__ == "__main__":
