@@ -196,7 +196,6 @@ ADRIATIC_COAST = [
 # ============================================================================
 
 _RUNTIME = {
-    # Local scope
     "focus_radius_km": 120.0,
     "threat_radius_km": 20.0,
     "arrival_pixel_threshold": 20,
@@ -205,14 +204,15 @@ _RUNTIME = {
     "step_min": 5.0,
     "min_size_px": 20,
     "min_sri_mmh": 0.0,
-    # Flow field
+    # Flow field — bumped averaging to 8 pairs = 40 min (was 5 = 25 min)
     "flow_downsample": 2,
     "flow_block_px": 24,
     "flow_search_px": 10,
-    "flow_average_pairs": 5,
+    "flow_average_pairs": 8,
     "flow_smooth_sigma": 2.0,
     # Display
-    "fit_check_overlay": False,   # NEW — overlay raw DHMZ frame at 30% for fit debug
+    "fit_check_overlay": False,
+    "arrow_min_speed_kmh": 5.0,   # NEW — display filter, arrows only shown above this
     # View
     "radius_km": 80.0,
     "weather_radius_km": 5.0,
@@ -245,9 +245,10 @@ _RUNTIME_TYPES = {
     "flow_downsample": (int, 1, 6),
     "flow_block_px": (int, 6, 64),
     "flow_search_px": (int, 2, 32),
-    "flow_average_pairs": (int, 1, 8),
+    "flow_average_pairs": (int, 1, 12),
     "flow_smooth_sigma": (float, 0.0, 8.0),
     "fit_check_overlay": (bool, None, None),
+    "arrow_min_speed_kmh": (float, 0.0, 30.0),
     "radius_km": (float, 20.0, 1000.0),
     "weather_radius_km": (float, 0.5, 100.0),
     "view_rotation_auto": (bool, None, None),
@@ -1031,11 +1032,43 @@ def analyze_frame(frame, map_region, intensity_mode, sri_legend, legend_mask):
 # SECTION 10 — Flow field estimation (blockwise cross-correlation)
 # ============================================================================
 
+def _subpixel_peak(corr, py, px):
+    """Refine an integer correlation peak to sub-pixel via parabolic fit.
+
+    For slow storms (< 1 px per frame of motion), the integer argmax flips
+    between adjacent offsets frame-to-frame, which makes velocity direction
+    swing wildly. Parabolic fitting resolves the peak to ~0.05 px, which
+    when combined with temporal averaging gives stable velocities even for
+    sub-pixel motion.
+    """
+    sub_dy = 0.0
+    sub_dx = 0.0
+    if 0 < py < corr.shape[0] - 1:
+        c0 = float(corr[py - 1, px])
+        c1 = float(corr[py, px])
+        c2 = float(corr[py + 1, px])
+        denom = c0 - 2.0 * c1 + c2
+        if abs(denom) > 1e-9:
+            sub_dy = 0.5 * (c0 - c2) / denom
+    if 0 < px < corr.shape[1] - 1:
+        c0 = float(corr[py, px - 1])
+        c1 = float(corr[py, px])
+        c2 = float(corr[py, px + 1])
+        denom = c0 - 2.0 * c1 + c2
+        if abs(denom) > 1e-9:
+            sub_dx = 0.5 * (c0 - c2) / denom
+    # Parabolic fit is only valid very close to the peak
+    sub_dy = max(-0.5, min(0.5, sub_dy))
+    sub_dx = max(-0.5, min(0.5, sub_dx))
+    return py + sub_dy, px + sub_dx
+
+
 def estimate_flow_field(prev_mask, curr_mask, block_px=16, search_px=8, downsample=2):
     """Blockwise TREC-style motion field between two consecutive masks.
 
     Returns flow (H, W, 2) where flow[y, x] = (dx_px, dy_px) is the per-frame
-    displacement of the block containing (y, x), in full-resolution pixels.
+    displacement of the block containing (y, x), in FULL-resolution pixels
+    (float, sub-pixel precision).
 
     Image convention: y increases downward, x increases rightward. So dy > 0
     means motion is southward; dx > 0 means motion is eastward.
@@ -1057,8 +1090,8 @@ def estimate_flow_field(prev_mask, curr_mask, block_px=16, search_px=8, downsamp
     pad = search_px
     curr_pad = np.pad(curr_small, pad, mode='constant')
 
-    best_dy = np.zeros((ny, nx), dtype=np.int32)
-    best_dx = np.zeros((ny, nx), dtype=np.int32)
+    best_dy = np.zeros((ny, nx), dtype=np.float32)
+    best_dx = np.zeros((ny, nx), dtype=np.float32)
 
     for by in range(ny):
         y0 = by * block_px
@@ -1073,8 +1106,9 @@ def estimate_flow_field(prev_mask, curr_mask, block_px=16, search_px=8, downsamp
                 continue
             corr = correlate2d(search, p, mode='valid')
             idx = np.unravel_index(np.argmax(corr), corr.shape)
-            best_dy[by, bx] = idx[0] - pad
-            best_dx[by, bx] = idx[1] - pad
+            sub_dy, sub_dx = _subpixel_peak(corr, idx[0], idx[1])
+            best_dy[by, bx] = sub_dy - pad
+            best_dx[by, bx] = sub_dx - pad
 
     flow_low = np.zeros((ny * block_px, nx * block_px, 2), dtype=np.float32)
     for by in range(ny):
@@ -1095,14 +1129,16 @@ def estimate_flow_field(prev_mask, curr_mask, block_px=16, search_px=8, downsamp
     return flow_full[:H, :W]
 
 
-def combined_flow(flows, frame_idx, average_pairs=3, smooth_sigma=2.0):
+def combined_flow(flows, frame_idx, average_pairs=8, smooth_sigma=2.0):
     """Temporal mean of the last `average_pairs` flow pairs, then spatially
     smoothed with a Gaussian.
 
-    Spatial smoothing (sigma in full-resolution pixels) removes block-to-block
-    correlation noise while preserving the broad flow pattern. sigma=2 px
-    is sub-block, sigma=4–8 px smooths within a block, sigma>8 starts to
-    over-smooth storm-scale features.
+    average_pairs=8 at 5-min cadence = 40 min lookback, matching the upper
+    end of the old adaptive velocity window. The mean of N pairwise flows is
+    mathematically equivalent to a least-squares slope fit through N+1
+    positions when motion is constant — this is why averaging is sufficient
+    for translation, provided the pairwise flows themselves are unbiased
+    (which sub-pixel fitting ensures).
     """
     if not flows or frame_idx <= 0:
         return None
@@ -1120,8 +1156,6 @@ def combined_flow(flows, frame_idx, average_pairs=3, smooth_sigma=2.0):
 
 
 def flow_to_kmh(flow_field, calib, frame_interval_min, x, y):
-    """Sample a single flow vector at (x, y). Kept for compatibility; prefer
-    cluster_flow_velocity() for display."""
     y_i = max(0, min(flow_field.shape[0] - 1, int(y)))
     x_i = max(0, min(flow_field.shape[1] - 1, int(x)))
     dx_px = float(flow_field[y_i, x_i, 0])
@@ -1133,7 +1167,13 @@ def flow_to_kmh(flow_field, calib, frame_interval_min, x, y):
 
 def cluster_flow_velocity(flow_field, label_array, label, calib,
                           frame_interval_min):
-    """Robust velocity for a cluster: median flow across all its pixels.
+    """Robust velocity for a cluster: MEAN flow across all its pixels.
+
+    Mean (not median) matches the old system's centroid-displacement velocity.
+    For a translating storm, mean(fx) is the centroid's x-velocity, which is
+    what the old linear-fit method recovered. Median jumps between motion
+    modes for clusters that contain both leading and trailing edges (mixed
+    motion), which was a source of arrow swinging.
 
     Returns (vx_kmh, vy_kmh, coherence) where coherence ∈ [0, 1] is the
     circular variance of per-pixel flow directions inside the cluster.
@@ -1151,8 +1191,9 @@ def cluster_flow_velocity(flow_field, label_array, label, calib,
     active = (np.abs(fx) + np.abs(fy)) > 0.01
     if int(active.sum()) < 4:
         return 0.0, 0.0, 0.0
-    dx_px = float(np.median(fx[active]))
-    dy_px = float(np.median(fy[active]))
+    # MEAN not median — mass-weighted centroid velocity matches old behavior
+    dx_px = float(fx[active].mean())
+    dy_px = float(fy[active].mean())
     angles = np.arctan2(fy[active], fx[active])
     mean_cos = float(np.cos(angles).mean())
     mean_sin = float(np.sin(angles).mean())
