@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-DHMZ radar + pljusak station tracker with satellite basemap.
+DHMZ radar + pljusak station tracker with satellite basemap & storm frame archiver.
 
 Endpoints:
   /                    HTML dashboard
   /threat.png          Current frame: satellite/radar composite + overlays
   /threat.gif          Animated composite
-  /status              JSON: summary + local_weather + sensors + threats
+  /status              JSON: summary + local_weather + sensors + threats + archive
   /settings            GET/POST hot-swappable runtime settings
   /config              GET full JSON config (POST replace, DELETE reset)
+  /archive             GET archived storm episodes & frame counts
   /refresh             POST force refresh
   /accuracy            GET stats, /accuracy/predictions, /accuracy/events
   /accuracy/reset      POST clear scores
@@ -16,6 +17,7 @@ Endpoints:
 
 Config persists to <data-dir>/config.json. Default <data-dir> is /data.
 Basemap cache at <data-dir>/basemap_cache/.
+Storm frame archive at <data-dir>/archive/<YYYY-MM-DD_HHMMZ>/.
 """
 
 import argparse
@@ -190,6 +192,9 @@ _RUNTIME = {
     "min_size_px": 30,
     "radius_km": 150.0,
     "weather_radius_km": 5.0,
+    "archive_enabled": True,
+    "archive_radius_km": 200.0,
+    "archive_min_pixels": 40,
     "poll_s": 300,
     "view_rotation_auto": True,
     "view_rotation": 0.0,
@@ -213,6 +218,9 @@ _RUNTIME_TYPES = {
     "min_size_px": (int, 5, 5000),
     "radius_km": (float, 20.0, 1000.0),
     "weather_radius_km": (float, 0.5, 100.0),
+    "archive_enabled": (bool, None, None),
+    "archive_radius_km": (float, 20.0, 500.0),
+    "archive_min_pixels": (int, 10, 5000),
     "poll_s": (int, 30, 7200),
     "view_rotation_auto": (bool, None, None),
     "view_rotation": (float, 0.0, 360.0),
@@ -292,6 +300,8 @@ _CLI_TO_RUNTIME = {
     "min_size": "min_size_px",
     "radius": "radius_km",
     "weather_radius": "weather_radius_km",
+    "archive_radius": "archive_radius_km",
+    "archive_min_pixels": "archive_min_pixels",
     "poll": "poll_s",
     "view_rotation": "view_rotation",
     "basemap": "basemap",
@@ -351,6 +361,7 @@ _CLI_TO_STATIC_BOOL = {
 _CLI_TO_RUNTIME_BOOL = {
     "cities": "show_cities",
     "view_rotation_auto": "view_rotation_auto",
+    "archive_enabled": "archive_enabled",
 }
 
 _VIZ_STATE = {
@@ -547,12 +558,6 @@ def cluster_label(idx):
 # Coast rotation (satellite edge detection + polyline fallback)
 # ----------------------------------------------------------------------------
 def detect_coast_rotation_from_satellite(basemap_north_up):
-    """
-    Detect dominant coastline orientation from a North-up (0 deg) satellite basemap
-    using water segmentation + morphological coastline edge detection + Sobel gradients.
-    Returns the compass bearing (degrees CW from North) pointing seaward (land -> sea)
-    so that rotating the view to that bearing places the sea at the TOP (UP).
-    """
     if basemap_north_up is None:
         return None
     arr = np.asarray(basemap_north_up.convert("RGB"), dtype=np.float32)
@@ -589,8 +594,8 @@ def detect_coast_rotation_from_satellite(basemap_north_up):
         return None
 
     smooth_water = ndimage.gaussian_filter(water.astype(np.float32), sigma=3.0)
-    gx = ndimage.sobel(smooth_water, axis=1)  # +x = East
-    gy = ndimage.sobel(smooth_water, axis=0)  # +y = South
+    gx = ndimage.sobel(smooth_water, axis=1)
+    gy = ndimage.sobel(smooth_water, axis=0)
 
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
     cy, cx = H / 2.0, W / 2.0
@@ -610,7 +615,6 @@ def detect_coast_rotation_from_satellite(basemap_north_up):
 
 
 def compute_coast_rotation(target_lat, target_lon, max_dist_km=100.0):
-    """Polyline fallback: ADRIATIC_COAST runs NW->SE (~135 deg); +90 deg points seaward (SW)."""
     best_dist = float("inf")
     best_bearing = None
     for (lat1, lon1), (lat2, lon2) in zip(ADRIATIC_COAST, ADRIATIC_COAST[1:]):
@@ -838,6 +842,17 @@ class Calibration:
         coslat = math.cos(math.radians(t_lat))
         return (lon - t_lon) * 111.32 * coslat, (lat - t_lat) * 111.32
 
+    def radius_mask(self, h, w, t_lat, t_lon, radius_km):
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+        lx = xx - self.map_region.x0
+        ly = yy - self.map_region.y0
+        lat = self.coef_lat[0] * lx + self.coef_lat[1] * ly + self.coef_lat[2]
+        lon = self.coef_lon[0] * lx + self.coef_lon[1] * ly + self.coef_lon[2]
+        coslat = math.cos(math.radians(t_lat))
+        dx = (lon - t_lon) * 111.32 * coslat
+        dy = (lat - t_lat) * 111.32
+        return (dx * dx + dy * dy) <= (radius_km * radius_km)
+
 
 def load_calibration(path, inline, image_size=None):
     if inline:
@@ -1004,6 +1019,255 @@ def analyze_frame(frame, map_region, intensity_mode, sri_legend, legend_mask):
 
 
 # ----------------------------------------------------------------------------
+# Storm Frame Archiver (deduplicated PNGs grouped by storm episode)
+# ----------------------------------------------------------------------------
+class StormArchiver:
+    """
+    Archives individual deduplicated radar PNG frames whenever precipitation
+    occurs within `archive_radius_km` of the target location.
+
+    Each frame is timestamped by its exact radar frame UTC timestamp
+    (so overlapping 30-frame GIF polls never store duplicate frames, while
+    automatic historical backfill still captures the full 2.5h ramp-up of a storm).
+    Frames within 45 minutes of one another are grouped into an episode folder
+    named `<YYYY-MM-DD_HHMMZ>` alongside an `event.json` summary.
+    """
+    EPISODE_GAP_MIN = 45.0
+
+    def __init__(self, data_dir, calib, target_lat, target_lon, target_name):
+        self.data_dir = data_dir
+        self.root_dir = os.path.join(data_dir, "archive") if data_dir else None
+        self.calib = calib
+        self.target_lat = target_lat
+        self.target_lon = target_lon
+        self.target_name = target_name
+        self.lock = threading.Lock()
+        self._mask_cache = {}  # (h, w, round(radius_km, 1)) -> bool ndarray
+        self.total_frames_saved = 0
+        self.total_episodes = 0
+        self.last_episode_id = None
+        self.last_saved_utc = None
+        if self.root_dir:
+            try:
+                os.makedirs(self.root_dir, exist_ok=True)
+                self._scan_existing()
+            except OSError as e:
+                print(f"archive: cannot create {self.root_dir}: {e}", file=sys.stderr)
+                self.root_dir = None
+
+    def _scan_existing(self):
+        if not self.root_dir or not os.path.isdir(self.root_dir):
+            return
+        episodes = sorted(
+            d for d in os.listdir(self.root_dir)
+            if os.path.isdir(os.path.join(self.root_dir, d))
+        )
+        self.total_episodes = len(episodes)
+        if episodes:
+            self.last_episode_id = episodes[-1]
+        count = 0
+        for ep in episodes:
+            ep_dir = os.path.join(self.root_dir, ep)
+            try:
+                count += sum(1 for f in os.listdir(ep_dir) if f.endswith(".png"))
+            except OSError:
+                pass
+        self.total_frames_saved = count
+
+    def _get_radius_mask(self, h, w, radius_km):
+        key = (h, w, round(float(radius_km), 1))
+        m = self._mask_cache.get(key)
+        if m is None:
+            m = self.calib.radius_mask(h, w, self.target_lat, self.target_lon, radius_km)
+            if len(self._mask_cache) > 8:
+                self._mask_cache.clear()
+            self._mask_cache[key] = m
+        return m
+
+    def _parse_episode_start(self, ep_name):
+        try:
+            return datetime.strptime(ep_name, "%Y-%m-%d_%H%MZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    def _resolve_episode_dir(self, frame_ts_utc):
+        """Find an existing episode whose time range covers or borders `frame_ts_utc`."""
+        best_ep = None
+        best_gap = float("inf")
+        for d in sorted(os.listdir(self.root_dir)):
+            ep_dir = os.path.join(self.root_dir, d)
+            if not os.path.isdir(ep_dir):
+                continue
+            meta_path = os.path.join(ep_dir, "event.json")
+            meta = _load_json_file(meta_path)
+            start_dt = _safe_fromiso(meta.get("start_utc")) if meta else self._parse_episode_start(d)
+            end_dt = _safe_fromiso(meta.get("end_utc")) if meta else start_dt
+            if start_dt == datetime.min.replace(tzinfo=timezone.utc):
+                continue
+            if (start_dt - timedelta(minutes=self.EPISODE_GAP_MIN)) <= frame_ts_utc <= (
+                    end_dt + timedelta(minutes=self.EPISODE_GAP_MIN)):
+                gap = abs((frame_ts_utc - end_dt).total_seconds()) / 60.0
+                if gap < best_gap:
+                    best_gap = gap
+                    best_ep = d
+
+        if best_ep is not None:
+            return best_ep, os.path.join(self.root_dir, best_ep), False
+
+        ep_id = frame_ts_utc.strftime("%Y-%m-%d_%H%MZ")
+        ep_dir = os.path.join(self.root_dir, ep_id)
+        os.makedirs(ep_dir, exist_ok=True)
+        return ep_id, ep_dir, True
+
+    def process_animation(self, img, frame_masks_mmh, last_frame_ts_utc,
+                          eff_interval_min, fallback_now_utc, rt,
+                          local_weather=None, target_raining=False):
+        """
+        Inspect all frames in the fetched GIF. Any frame with >= `archive_min_pixels`
+        of precipitation inside `archive_radius_km` is saved as a deduplicated
+        palette-optimized PNG inside its storm episode directory.
+        """
+        if not self.root_dir or not rt.get("archive_enabled", True):
+            return 0
+
+        radius_km = float(rt.get("archive_radius_km", 200.0))
+        min_px = int(rt.get("archive_min_pixels", 40))
+        n_frames = len(frame_masks_mmh)
+        if n_frames == 0:
+            return 0
+
+        anchor_utc = last_frame_ts_utc or fallback_now_utc
+        # Round anchor to nearest minute for deterministic filenames when OCR is unavailable
+        anchor_utc = anchor_utc.replace(second=0, microsecond=0)
+
+        saved_this_cycle = 0
+        with self.lock:
+            for idx, (mask, mmh) in enumerate(frame_masks_mmh):
+                h, w = mask.shape
+                rmask = self._get_radius_mask(h, w, radius_km)
+                local_precip = mask & rmask
+                px_count = int(local_precip.sum())
+                if px_count < min_px:
+                    continue
+
+                minutes_before_last = (n_frames - 1 - idx) * eff_interval_min
+                frame_ts = anchor_utc - timedelta(minutes=round(minutes_before_last))
+                fname = frame_ts.strftime("%Y%m%d_%H%M%SZ.png")
+
+                ep_id, ep_dir, is_new_ep = self._resolve_episode_dir(frame_ts)
+                if is_new_ep:
+                    self.total_episodes += 1
+
+                fpath = os.path.join(ep_dir, fname)
+                if os.path.exists(fpath):
+                    continue
+
+                try:
+                    img.seek(idx)
+                    frame_pil = img.convert("P", palette=Image.ADAPTIVE, colors=64)
+                    tmp_path = fpath + ".tmp"
+                    frame_pil.save(tmp_path, format="PNG", optimize=True)
+                    os.replace(tmp_path, fpath)
+                except Exception as e:
+                    print(f"archive: frame save error {e}", file=sys.stderr)
+                    continue
+
+                peak_mmh = float(mmh[local_precip].max()) if px_count > 0 else 0.0
+                mean_mmh = float(mmh[local_precip].mean()) if px_count > 0 else 0.0
+                self._update_episode_meta(
+                    ep_dir, ep_id, frame_ts, radius_km, px_count,
+                    peak_mmh, mean_mmh,
+                    local_weather if idx == n_frames - 1 else None,
+                    target_raining if idx == n_frames - 1 else False,
+                )
+                saved_this_cycle += 1
+                self.total_frames_saved += 1
+                self.last_episode_id = ep_id
+                self.last_saved_utc = frame_ts.isoformat()
+
+        try:
+            img.seek(0)
+        except Exception:
+            pass
+        return saved_this_cycle
+
+    def _update_episode_meta(self, ep_dir, ep_id, frame_ts, radius_km,
+                             px_count, peak_mmh, mean_mmh,
+                             local_weather, target_raining):
+        meta_path = os.path.join(ep_dir, "event.json")
+        meta = _load_json_file(meta_path) or {
+            "episode_id": ep_id,
+            "target": self.target_name,
+            "target_lat": self.target_lat,
+            "target_lon": self.target_lon,
+            "archive_radius_km": radius_km,
+            "start_utc": frame_ts.isoformat(),
+            "end_utc": frame_ts.isoformat(),
+            "frame_count": 0,
+            "max_precip_pixels": 0,
+            "peak_sri_mmh": 0.0,
+            "target_hit": False,
+        }
+        ts_iso = frame_ts.isoformat()
+        if ts_iso < meta["start_utc"]:
+            meta["start_utc"] = ts_iso
+        if ts_iso > meta["end_utc"]:
+            meta["end_utc"] = ts_iso
+        try:
+            meta["frame_count"] = sum(
+                1 for f in os.listdir(ep_dir) if f.endswith(".png")
+            )
+        except OSError:
+            meta["frame_count"] = meta.get("frame_count", 0) + 1
+        meta["max_precip_pixels"] = max(int(meta.get("max_precip_pixels", 0)), px_count)
+        meta["peak_sri_mmh"] = round(max(float(meta.get("peak_sri_mmh", 0.0)), peak_mmh), 1)
+        if target_raining:
+            meta["target_hit"] = True
+        if local_weather and local_weather.station_count > 0:
+            meta["latest_local_weather"] = {
+                "temp_c": local_weather.temp_c,
+                "pressure_hpa": local_weather.pressure_hpa,
+                "wind_speed_kmh": local_weather.wind_speed_kmh,
+                "wind_gust_kmh": local_weather.wind_gust_kmh,
+                "wind_dir_deg": local_weather.wind_dir_deg,
+                "precip_today_mm": local_weather.precip_today_mm,
+            }
+        _save_json_file(meta_path, meta)
+
+    def summary(self):
+        with self.lock:
+            return {
+                "enabled": bool(self.root_dir and _snapshot().get("archive_enabled", True)),
+                "archive_dir": self.root_dir,
+                "radius_km": _snapshot().get("archive_radius_km", 200.0),
+                "total_episodes": self.total_episodes,
+                "total_frames": self.total_frames_saved,
+                "last_episode": self.last_episode_id,
+                "last_saved_utc": self.last_saved_utc,
+            }
+
+    def list_episodes(self, limit=30):
+        if not self.root_dir or not os.path.isdir(self.root_dir):
+            return []
+        out = []
+        with self.lock:
+            dirs = sorted(
+                (d for d in os.listdir(self.root_dir)
+                 if os.path.isdir(os.path.join(self.root_dir, d))),
+                reverse=True,
+            )[:limit]
+            for d in dirs:
+                ep_dir = os.path.join(self.root_dir, d)
+                meta = _load_json_file(os.path.join(ep_dir, "event.json"))
+                if meta:
+                    out.append(meta)
+                else:
+                    n = sum(1 for f in os.listdir(ep_dir) if f.endswith(".png"))
+                    out.append({"episode_id": d, "frame_count": n})
+        return out
+
+
+# ----------------------------------------------------------------------------
 # Clustering + tracking
 # ----------------------------------------------------------------------------
 @dataclass
@@ -1017,10 +1281,6 @@ class PixelCluster:
 
 
 def clusters_from_mask(mask, min_pixels, mmh=None):
-    """
-    Extract connected radar clusters and compute intensity-weighted centroids
-    so strong convective cores anchor tracking instead of ragged outer edges.
-    """
     label_array, n = ndimage.label(mask, structure=np.ones((3, 3)))
     if n == 0:
         return [], label_array
@@ -1065,7 +1325,6 @@ class Track:
 
 
 def _select_recent_window(obs, frame_interval_min, split_frames=None):
-    """Select trailing observations within VELOCITY_WINDOW_MIN after the latest split."""
     if len(obs) <= 1:
         return obs
     if split_frames:
@@ -1086,7 +1345,6 @@ def _select_recent_window(obs, frame_interval_min, split_frames=None):
 
 
 def _estimate_pixel_velocity(obs, frame_interval_min, split_frames=None):
-    """Estimate recent pixel velocity (px/frame) for frame-to-frame motion prediction."""
     window = _select_recent_window(obs, frame_interval_min, split_frames)
     if len(window) < 2:
         return 0.0, 0.0
@@ -1108,10 +1366,6 @@ def _estimate_pixel_velocity(obs, frame_interval_min, split_frames=None):
 
 
 def _estimate_velocity_kmh(obs, calib, frame_interval_min, split_frames=None):
-    """
-    Estimate recent geographic velocity (vx_kmh East, vy_kmh North) via
-    sqrt(size)-weighted linear regression over the trailing 25-minute window.
-    """
     window = _select_recent_window(obs, frame_interval_min, split_frames)
     if len(window) < 2:
         return 0.0, 0.0
@@ -1159,6 +1413,7 @@ def track_animation(img, calib, frame_interval_min, target_lat, target_lon,
     prev_clusters, prev_ids = [], []
     n_frames = 0
     rain_history = []
+    frame_masks_mmh = []
     last_label_array = None
     last_mask = last_mmh = None
     last_frame_events = {}
@@ -1177,6 +1432,7 @@ def track_animation(img, calib, frame_interval_min, target_lat, target_lon,
         n_frames += 1
         mask, mmh = analyze_frame(frame, calib.map_region, intensity_mode,
                                   sri_legend, legend_mask)
+        frame_masks_mmh.append((mask, mmh))
         last_mask, last_mmh = mask, mmh
         h, w = mask.shape
         if 0 <= yi < h and 0 <= xi < w:
@@ -1289,7 +1545,8 @@ def track_animation(img, calib, frame_interval_min, target_lat, target_lon,
         tr.event = last_frame_events.get(tid)
         tracks.append(tr)
     return (last_mask, last_mmh, tracks, n_frames, rain_history,
-            last_label_array, tracks_by_id, split_frames_by_id, cluster_first_target_hit)
+            last_label_array, tracks_by_id, split_frames_by_id,
+            cluster_first_target_hit, frame_masks_mmh)
 
 
 # ----------------------------------------------------------------------------
@@ -1709,11 +1966,6 @@ class PljusakClient:
         return slope, "stable"
 
     def rain_rate_mmh(self, slug, window_min=12):
-        """
-        Compute instantaneous/recent rainfall rate (mm/h) from monotonic daily
-        accumulation (oborineD), falling back to positive oborine1h increments
-        across midnight resets.
-        """
         h = self.history.get(slug)
         if not h or len(h) < 2:
             return None
@@ -1742,11 +1994,6 @@ class PljusakClient:
 
 
 def summarize_local_weather(stations, radius_km, max_age_min):
-    """
-    Aggregate fresh Pljusak stations within `radius_km` (default 5 km) into
-    robust local weather metrics: medians for scalar fields, max for gusts,
-    and speed-weighted circular vector mean for wind heading in degrees.
-    """
     lw = LocalWeather(radius_km=float(radius_km))
     fresh = [
         s for s in stations
@@ -2003,7 +2250,6 @@ def _apply_basemap_color_control(pil_img, rt):
 
 
 def _colorize_dhmz_sri(mask, mmh):
-    """Map mm/h values onto the official 16-level DHMZ SRI color scale."""
     H, W = mask.shape
     color = np.zeros((H, W, 3), dtype=np.uint8)
     if not mask.any():
@@ -2032,13 +2278,9 @@ def _radar_to_grayscale(mask, mmh):
 
 def _sample_radar_at_view(gray, radar_mask, radar_mmh, calib, target_lat, target_lon,
                           radius_km, view_rot, out_w, out_h):
-    """
-    Sample radar onto the view grid where `view_rot` (degrees CW from North)
-    points UP (top of screen), matching Mapbox Static Images bearing convention.
-    """
     H, W = out_h, out_w
     xs = np.arange(W, dtype=np.float32) - W / 2.0
-    ys = -(np.arange(H, dtype=np.float32) - H / 2.0)  # +ys = UP on screen
+    ys = -(np.arange(H, dtype=np.float32) - H / 2.0)
     X, Y = np.meshgrid(xs, ys)
     kpp_x = 2.0 * radius_km / W
     kpp_y = 2.0 * radius_km / H
@@ -2072,10 +2314,6 @@ def _sample_radar_at_view(gray, radar_mask, radar_mmh, calib, target_lat, target
 
 def _latlon_to_overlay_px(calib, target_lat, target_lon, radius_km, size_px,
                            view_rot, lat, lon):
-    """
-    Project (lat, lon) onto overlay pixel coordinates where `view_rot`
-    (degrees CW from North) points UP (top of screen).
-    """
     coslat = math.cos(math.radians(target_lat))
     dx_km = (lon - target_lon) * 111.32 * coslat
     dy_km = (lat - target_lat) * 111.32
@@ -2126,7 +2364,6 @@ def _draw_circle_outline(rgb, cx, cy, radius, color, thickness=1):
 
 
 def _draw_coast_overlay(rgb, calib, target_lat, target_lon, radius_km, view_rot, size_px):
-    """Draw the coastline. Only used when basemap is not satellite."""
     coast_color = (200, 200, 200)
     for (la1, lo1), (la2, lo2) in zip(ADRIATIC_COAST, ADRIATIC_COAST[1:]):
         steps = max(2, int(max(abs(la2 - la1), abs(lo2 - lo1)) / 0.03))
@@ -2161,10 +2398,6 @@ def _draw_text_outlined(draw, x, y, text, fill, outline):
 
 
 def _draw_arrow(draw, x0, y0, x1, y1, color, outline=(0, 0, 0)):
-    """
-    Draw a velocity vector arrow from centroid (x0, y0) to 1-hour projected
-    endpoint (x1, y1), with dark casing for contrast over radar and terrain.
-    """
     dx = x1 - x0
     dy = y1 - y0
     length = math.hypot(dx, dy)
@@ -2224,7 +2457,6 @@ def _draw_scale_bar(img, cx, cy, radius_km, size_px, view_rot):
 
 
 def _draw_legend(pil_img, confirm_mm):
-    """Draw compact legend for ground stations, 1h track arrows, and DHMZ SRI scale."""
     W, H = pil_img.size
     box_w, box_h = 228, 74
     x0 = W - box_w - 10
@@ -2520,12 +2752,15 @@ a{color:#5cf}.hint{color:#666;font-size:11px;margin-top:4px}
 .cfgpath{font-family:monospace;color:#7c7}
 </style></head><body>
 <h1>DHMZ Radar Tracker</h1>
-<p><a href="/threat.gif">/threat.gif</a> · <a href="/threat.png">/threat.png</a> · <a href="/status">/status</a> · <a href="/settings">/settings</a> · <a href="/config">/config</a> · <a href="/accuracy">/accuracy</a></p>
+<p><a href="/threat.gif">/threat.gif</a> · <a href="/threat.png">/threat.png</a> · <a href="/status">/status</a> · <a href="/settings">/settings</a> · <a href="/config">/config</a> · <a href="/archive">/archive</a> · <a href="/accuracy">/accuracy</a></p>
 <div class="layout">
 <div class="left">
 <div class="status" id="status">Loading...</div>
 <div class="section"><h3>Local Weather (Pljusak)</h3>
 <div id="local_wx">Loading...</div>
+</div>
+<div class="section"><h3>Storm Frame Archive</h3>
+<div id="archive_box">Loading...</div>
 </div>
 <div class="section"><h3>Accuracy</h3>
 <div id="accuracy">Loading...</div>
@@ -2546,6 +2781,9 @@ a{color:#5cf}.hint{color:#666;font-size:11px;margin-top:4px}
 <div class="field"><label>Threat min SRI (mm/h)</label><input type="number" id="threat_min_sri_mmh" min="0" max="500" step="0.5"></div>
 <div class="field"><label>Map radius (km)</label><input type="number" id="radius_km" min="20" max="1000" step="10"></div>
 <div class="field"><label>Local weather radius (km)</label><input type="number" id="weather_radius_km" min="0.5" max="100" step="0.5"></div>
+<div class="field"><label>Archive storm frames</label><input type="checkbox" id="archive_enabled"></div>
+<div class="field"><label>Archive radius (km)</label><input type="number" id="archive_radius_km" min="20" max="500" step="10"></div>
+<div class="field"><label>Archive min precip (px)</label><input type="number" id="archive_min_pixels" min="10" max="5000" step="10"></div>
 <div class="field"><label>Min cell size (px)</label><input type="number" id="min_size_px" min="5" max="5000" step="5"></div>
 <div class="field"><label>Min duration (fr)</label><input type="number" id="min_duration_frames" min="1" max="50" step="1"></div>
 <div class="field"><label>View rotation: auto (coast)</label><input type="checkbox" id="view_rotation_auto"></div>
@@ -2576,7 +2814,7 @@ a{color:#5cf}.hint{color:#666;font-size:11px;margin-top:4px}
 </div>
 </div>
 <script>
-const RT_FIELDS=['approaching_radius_km','cluster_radius_weight','only_approach_deg','threat_radius_km','threat_angle_deg','threat_min_duration','threat_min_sri_mmh','radius_km','weather_radius_km','min_size_px','min_duration_frames','view_rotation_auto','view_rotation','basemap','basemap_saturation','basemap_brightness','basemap_contrast','show_cities','poll_s','web_scale','settings_tag'];
+const RT_FIELDS=['approaching_radius_km','cluster_radius_weight','only_approach_deg','threat_radius_km','threat_angle_deg','threat_min_duration','threat_min_sri_mmh','radius_km','weather_radius_km','archive_enabled','archive_radius_km','archive_min_pixels','min_size_px','min_duration_frames','view_rotation_auto','view_rotation','basemap','basemap_saturation','basemap_brightness','basemap_contrast','show_cities','poll_s','web_scale','settings_tag'];
 const MAIN_SENSORS=['raining_now','raining_confirmed','rain_confidence','rain_duration_min','rain_end_eta_min','next_rain_eta_min','gap_min','summary','radar_intensity_mmh','nearest_station_mm','intensity_mmh','station_trend','upstream_trend','local_temp_c','local_humidity','local_pressure_hpa','local_wind_speed_kmh','local_wind_gust_kmh','local_wind_dir_deg','local_wind_dir','local_rain_today_mm','local_rain_1h_mm','local_rain_rate_mmh'];
 const DIAG_SENSORS=['coverage_map','nowcast_error_min','data_age_min','frame_timestamp','cell_count','nearest_cell_km','nearest_cell_eta_min','nearest_station_km','nearest_station_age_min','station_count_wet','station_count_fresh','station_wet_fraction','station_median_mm','local_weather_stations'];
 function setField(k,v){const el=document.getElementById(k);if(!el)return;if(el.type==='checkbox')el.checked=!!v;else el.value=v;}
@@ -2599,6 +2837,14 @@ function loadStatus(){fetch('/status').then(r=>r.json()).then(s=>{const el=docum
  <div class="row"><span class="label">Basemap</span><span>${s.basemap_used||'—'}</span></div>
  <div class="row"><span class="label">Config</span><span class="cfgpath">${s.config_path||'(not persisted)'}</span></div>
  ${threatsHtml}`;
+ const arch=s.archive||{};
+ const archEl=document.getElementById('archive_box');
+ if(!arch.archive_dir){
+   archEl.innerHTML='<div class="hint">Persistence disabled (no data-dir)</div>';
+ }else{
+   archEl.innerHTML=`<div class="hint">Status: ${arch.enabled?'Active':'Paused'} (radius ≤ ${arch.radius_km||200} km) · Episodes: <b>${arch.total_episodes||0}</b> · Frames: <b>${arch.total_frames||0}</b></div>
+   <div class="hint">Last episode: <span class="cfgpath">${arch.last_episode||'none'}</span>${arch.last_saved_utc?' · '+arch.last_saved_utc:''}</div>`;
+ }
  const wx=s.local_weather||{};
  const wxEl=document.getElementById('local_wx');
  if(!wx.station_count){
@@ -2677,6 +2923,8 @@ class _VizHandler(BaseHTTPRequestHandler):
             self._json(_snapshot())
         elif path == "/config":
             self._config_get()
+        elif path == "/archive":
+            self._archive(params)
         elif path == "/accuracy":
             self._accuracy(params)
         elif path == "/accuracy/predictions":
@@ -2742,6 +2990,15 @@ class _VizHandler(BaseHTTPRequestHandler):
             status = dict(_VIZ_STATE["status"])
         status["config_path"] = _VIZ_STATE.get("config_path")
         self._json(status)
+
+    def _archive(self, params):
+        arch = _VIZ_STATE.get("archiver")
+        if not arch:
+            self._json({"enabled": False, "episodes": []}); return
+        limit = int(params.get("n", 30))
+        res = arch.summary()
+        res["episodes"] = arch.list_episodes(limit=limit)
+        self._json(res)
 
     def _config_get(self):
         cfg_path = _VIZ_STATE.get("config_path")
@@ -3202,7 +3459,7 @@ def run(target_name, t_lat, t_lon, calib, once, dump_jsonl,
         intensity_mode, sri_legend, sri_thresholds,
         confirm_radius, confirm_mm, confirm_age,
         confirm_frac, confirm_min_count, threat_topic,
-        web_enabled, web_port, acc_store, data_dir,
+        web_enabled, web_port, acc_store, archiver, data_dir,
         mapbox_token, mapbox_style, basemap_size):
     out_fh = open(dump_jsonl, "a") if dump_jsonl else None
     rt = _snapshot()
@@ -3211,6 +3468,7 @@ def run(target_name, t_lat, t_lon, calib, once, dump_jsonl,
         print(f"Data dir: {data_dir}")
     print(f"Runtime: radius={rt['radius_km']:g}km "
           f"wx_radius={rt['weather_radius_km']:g}km "
+          f"archive={'on' if rt['archive_enabled'] else 'off'}({rt['archive_radius_km']:g}km) "
           f"approach={rt['approaching_radius_km']:g}km "
           f"threat={rt['threat_radius_km']:g}km "
           f"min_sri={rt['threat_min_sri_mmh']:g}mm/h "
@@ -3330,7 +3588,7 @@ def run(target_name, t_lat, t_lon, calib, once, dump_jsonl,
 
                 (last_mask, last_mmh, tracks, n_frames, rain_history,
                  label_array, tracks_by_id, split_frames_by_id,
-                 cluster_first_hit) = track_animation(
+                 cluster_first_hit, frame_masks_mmh) = track_animation(
                     img, calib, eff_interval, t_lat, t_lon, intensity_mode,
                     sri_legend, legend_mask)
 
@@ -3367,6 +3625,17 @@ def run(target_name, t_lat, t_lon, calib, once, dump_jsonl,
                                       calib, t_lat, t_lon, confirm_radius,
                                       confirm_mm, confirm_age,
                                       confirm_frac, confirm_min_count, rt)
+
+                archived_now = 0
+                if archiver is not None:
+                    last_frame_utc = frame_ts_utc
+                    if last_frame_utc and timestamp_source == "first" and n_frames > 1:
+                        last_frame_utc = last_frame_utc + timedelta(
+                            minutes=(n_frames - 1) * eff_interval)
+                    archived_now = archiver.process_animation(
+                        img, frame_masks_mmh, last_frame_utc, eff_interval,
+                        now_utc, rt, local_weather=lw,
+                        target_raining=ca.raining_now)
 
                 if acc_store and acc_store.enabled:
                     settings_snapshot = {k: rt[k] for k in
@@ -3427,9 +3696,10 @@ def run(target_name, t_lat, t_lon, calib, once, dump_jsonl,
                         age_str = f" | radar {data_age_min:.0f} min ⚠⚠"
                     elif data_age_min > STALE_MIN:
                         age_str = f" | radar {data_age_min:.0f} min ⚠"
+                arch_str = f" | archived +{archived_now}" if archived_now > 0 else ""
                 print(f"\n=== {now_local.strftime('%H:%M:%S')} {tz_ab} | "
                       f"cells:{len(tracks)} ({n_approaching} approaching) | "
-                      f"frames:{n_frames} | {ca.confidence}{age_str} | "
+                      f"frames:{n_frames} | {ca.confidence}{age_str}{arch_str} | "
                       f"rot:{view_rot_used:.0f}°{'(auto)' if view_rot_auto else ''} ===")
                 for line in nc.lines: print(line)
                 if lw.station_count > 0:
@@ -3633,6 +3903,7 @@ def run(target_name, t_lat, t_lon, calib, once, dump_jsonl,
                         "threat_count": sum(threat_flags),
                         "threats": threat_list,
                         "local_weather": local_weather_dict,
+                        "archive": archiver.summary() if archiver else {"enabled": False},
                         "sensors": status_sensors,
                         "view_rotation_auto": view_rot_auto,
                         "view_rotation_used": view_rot_used,
@@ -3731,6 +4002,10 @@ def main():
     p.add_argument("--no-cities", dest="cities", action="store_false", default=None)
     p.add_argument("--radius", type=float, default=None)
     p.add_argument("--weather-radius", type=float, default=None)
+    p.add_argument("--archive", dest="archive_enabled",
+                   action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--archive-radius", type=float, default=None)
+    p.add_argument("--archive-min-pixels", type=int, default=None)
     p.add_argument("--poll", type=int, default=None)
     p.add_argument("--min-duration", type=int, default=None)
     p.add_argument("--min-size", type=int, default=None)
@@ -3912,6 +4187,14 @@ def main():
             print(f"WARNING: accuracy init failed: {e}", file=sys.stderr)
     _VIZ_STATE["acc_store"] = acc_store
 
+    archiver = None
+    if data_dir:
+        try:
+            archiver = StormArchiver(data_dir, calib, t_lat, t_lon, target_name)
+        except Exception as e:
+            print(f"WARNING: archive init failed: {e}", file=sys.stderr)
+    _VIZ_STATE["archiver"] = archiver
+
     web_enabled = bool(static.get("web_enabled", True))
     web_port = static.get("web_port") or 8080
     if web_enabled:
@@ -3938,7 +4221,7 @@ def main():
         static.get("station_confirm_fraction") or 0.5,
         static.get("station_confirm_min_count") or 1,
         static.get("mqtt_threat_topic"), web_enabled, web_port,
-        acc_store, data_dir,
+        acc_store, archiver, data_dir,
         static.get("mapbox_token"), static.get("mapbox_style") or "mapbox/satellite-v9",
         static.get("basemap_size") or 640)
 
