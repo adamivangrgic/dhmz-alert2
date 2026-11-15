@@ -4374,7 +4374,11 @@ class _VizHandler(BaseHTTPRequestHandler):
         ts, mask, mmh, _, fname = data[idx]
         gray = _radar_to_grayscale(mask, mmh)
         rt_cur = _snapshot()
-        _, view_rot_used = get_effective_rotation(rt_cur, eng.target_lat, eng.target_lon)
+
+        # Always point North (0.0°) and use archive_radius_km for archived replay frames
+        archive_rot = 0.0
+        archive_rad = float(rt_cur.get("archive_radius_km", 200.0))
+
         static_cur = _static_snapshot()
         size_px = static_cur.get("basemap_size") or 640
         bm_img = None
@@ -4383,13 +4387,13 @@ class _VizHandler(BaseHTTPRequestHandler):
             bm_img = fetch_basemap(
                 static_cur.get("mapbox_style") or "mapbox/satellite-v9",
                 static_cur["mapbox_token"], eng.target_lat, eng.target_lon,
-                rt_cur["radius_km"], view_rot_used, size_px, _VIZ_STATE.get("data_dir"))
+                archive_rad, archive_rot, size_px, _VIZ_STATE.get("data_dir"))
             if bm_img is not None:
                 bm_kind = "mapbox"
 
         pil = compose_map(
             mask, mmh, gray, eng.calib, eng.target_lat, eng.target_lon,
-            rt_cur["radius_km"], view_rot_used, size_px, bm_img, bm_kind,
+            archive_rad, archive_rot, size_px, bm_img, bm_kind,
             b_tracks, b_appr, b_af, b_tf, [], rt_cur["show_cities"],
             eng.intensity_mode, DEFAULT_SRI_THRESHOLDS, rt_cur,
             shadow_tracks=s_tracks)
