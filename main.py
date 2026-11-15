@@ -207,10 +207,12 @@ _RUNTIME = {
     "min_sri_mmh": 0.0,
     # Flow field
     "flow_downsample": 2,
-    "flow_block_px": 24,          # was 16 — larger blocks, more signal per correlation
-    "flow_search_px": 10,         # was 8 — wider search for fast storms
-    "flow_average_pairs": 5,      # was 3 — 25 min temporal average, smoother
-    "flow_smooth_sigma": 2.0,     # NEW — spatial Gaussian on the flow field
+    "flow_block_px": 24,
+    "flow_search_px": 10,
+    "flow_average_pairs": 5,
+    "flow_smooth_sigma": 2.0,
+    # Display
+    "fit_check_overlay": False,   # NEW — overlay raw DHMZ frame at 30% for fit debug
     # View
     "radius_km": 80.0,
     "weather_radius_km": 5.0,
@@ -245,6 +247,7 @@ _RUNTIME_TYPES = {
     "flow_search_px": (int, 2, 32),
     "flow_average_pairs": (int, 1, 8),
     "flow_smooth_sigma": (float, 0.0, 8.0),
+    "fit_check_overlay": (bool, None, None),
     "radius_km": (float, 20.0, 1000.0),
     "weather_radius_km": (float, 0.5, 100.0),
     "view_rotation_auto": (bool, None, None),
@@ -264,56 +267,31 @@ _RUNTIME_TYPES = {
 }
 
 _STATIC_DEFAULTS = {
-    "location": None,
-    "lat": None,
-    "lon": None,
-    "calibration_inline": DEFAULT_CALIBRATION_JSON,
-    "calibration": None,
+    "location": None, "lat": None, "lon": None,
+    "calibration_inline": DEFAULT_CALIBRATION_JSON, "calibration": None,
     "radar_intensity": "simple",
-    "sri_legend_region": None,
-    "sri_legend_orientation": "horizontal",
-    "sri_legend_padding": 1,
-    "sri_breaks": None,
-    "sri_thresholds": "2.5,10,30",
+    "sri_legend_region": None, "sri_legend_orientation": "horizontal",
+    "sri_legend_padding": 1, "sri_breaks": None, "sri_thresholds": "2.5,10,30",
     "frame_interval_min": 5.0,
     "timestamp_region": DEFAULT_TIMESTAMP_REGION_STR,
-    "timestamp_enabled": True,
-    "timestamp_tz": None,
-    "timestamp_source": "last",
-    "static_png_enabled": True,
-    "static_timestamp_region": None,
+    "timestamp_enabled": True, "timestamp_tz": None, "timestamp_source": "last",
+    "static_png_enabled": True, "static_timestamp_region": None,
     "display_tz": DEFAULT_DISPLAY_TZ,
-    "pljusak_enabled": True,
-    "pljusak_url": PLJUSAK_URL,
-    "pljusak_interval": 60,
-    "station_confirm_radius": 15.0,
-    "station_confirm_min_mm": 0.2,
-    "station_confirm_max_age_min": 15.0,
-    "station_confirm_fraction": 0.5,
+    "pljusak_enabled": True, "pljusak_url": PLJUSAK_URL, "pljusak_interval": 60,
+    "station_confirm_radius": 15.0, "station_confirm_min_mm": 0.2,
+    "station_confirm_max_age_min": 15.0, "station_confirm_fraction": 0.5,
     "station_confirm_min_count": 1,
-    "web_enabled": True,
-    "web_port": 8080,
-    "mqtt_enabled": True,
-    "mqtt_host": None,
-    "mqtt_port": 1883,
-    "mqtt_tls": False,
-    "mqtt_discovery_prefix": "homeassistant",
-    "mqtt_state_prefix": "dhmz_radar",
-    "mqtt_device_id": None,
-    "mqtt_device_name": "DHMZ Radar",
-    "mqtt_sensors": "all",
-    "mqtt_no_retain": False,
-    "mqtt_threat_topic": None,
-    "jsonl_dump": None,
-    "accuracy_enabled": True,
-    "mapbox_token": None,
-    "mapbox_style": "mapbox/satellite-v9",
-    "basemap_size": 640,
+    "web_enabled": True, "web_port": 8080,
+    "mqtt_enabled": True, "mqtt_host": None, "mqtt_port": 1883, "mqtt_tls": False,
+    "mqtt_discovery_prefix": "homeassistant", "mqtt_state_prefix": "dhmz_radar",
+    "mqtt_device_id": None, "mqtt_device_name": "DHMZ Radar",
+    "mqtt_sensors": "all", "mqtt_no_retain": False, "mqtt_threat_topic": None,
+    "jsonl_dump": None, "accuracy_enabled": True,
+    "mapbox_token": None, "mapbox_style": "mapbox/satellite-v9", "basemap_size": 640,
 }
 
 _RUNTIME = dict(_RUNTIME)
 _STATIC = dict(_STATIC_DEFAULTS)
-
 _RUNTIME_LOCK = threading.Lock()
 _STATIC_LOCK = threading.Lock()
 _FORCE_REFRESH = threading.Event()
@@ -323,8 +301,6 @@ _VIZ_STATE = {
     "lock": threading.Lock(),
 }
 
-# Replay render cache — used only for on-demand fallback renders when the
-# requested params differ from the params used at archive time.
 _REPLAY_CACHE = OrderedDict()
 _REPLAY_CACHE_MAX = 300
 _REPLAY_CACHE_LOCK = threading.Lock()
@@ -1478,7 +1454,6 @@ def buffer_to_pixels(buf, ts_region, ts_tz):
 # ============================================================================
 
 def _replay_params_hash(rt, st):
-    """Stable hash of parameters that affect replay rendering."""
     payload = {
         "threat_radius_km": rt["threat_radius_km"],
         "arrival_pixel_threshold": rt["arrival_pixel_threshold"],
@@ -1538,7 +1513,7 @@ class StormArchiver:
             ep_dir = os.path.join(self.root_dir, ep)
             try:
                 for f in os.listdir(ep_dir):
-                    if f.endswith(".replay.png"):
+                    if ".replay-" in f:
                         replay_count += 1
                     elif f.endswith(".png"):
                         count += 1
@@ -1595,13 +1570,11 @@ class StormArchiver:
                           local_weather=None, target_raining=False):
         if not self.root_dir or not rt.get("archive_enabled", True):
             return 0
-
         radius_km = float(rt.get("archive_radius_km", 100.0))
         min_px = int(rt.get("archive_min_pixels", 20))
         n_frames = len(frame_masks_mmh)
         if n_frames == 0:
             return 0
-
         params_hash = _replay_params_hash(rt, st)
         precompute = bool(rt.get("archive_precompute_replay", True)) and replay_renderer is not None
         saved_this_cycle = 0
@@ -1669,18 +1642,12 @@ class StormArchiver:
                              local_weather, target_raining):
         meta_path = os.path.join(ep_dir, "event.json")
         meta = _load_json_file(meta_path) or {
-            "episode_id": ep_id,
-            "target": self.target_name,
-            "target_lat": self.target_lat,
-            "target_lon": self.target_lon,
+            "episode_id": ep_id, "target": self.target_name,
+            "target_lat": self.target_lat, "target_lon": self.target_lon,
             "archive_radius_km": radius_km,
-            "start_utc": frame_ts.isoformat(),
-            "end_utc": frame_ts.isoformat(),
-            "frame_count": 0,
-            "max_precip_pixels": 0,
-            "peak_sri_mmh": 0.0,
-            "target_hit": False,
-            "replay_params_hash": params_hash,
+            "start_utc": frame_ts.isoformat(), "end_utc": frame_ts.isoformat(),
+            "frame_count": 0, "max_precip_pixels": 0, "peak_sri_mmh": 0.0,
+            "target_hit": False, "replay_params_hash": params_hash,
         }
         meta["replay_params_hash"] = params_hash
         ts_iso = frame_ts.isoformat()
@@ -1691,7 +1658,7 @@ class StormArchiver:
         try:
             meta["frame_count"] = sum(
                 1 for f in os.listdir(ep_dir)
-                if f.endswith(".png") and not f.endswith(".replay.png")
+                if f.endswith(".png") and ".replay-" not in f
             )
         except OSError:
             meta["frame_count"] = meta.get("frame_count", 0) + 1
@@ -1717,8 +1684,9 @@ class StormArchiver:
         ep_dir = os.path.join(self.root_dir, safe_id)
         if not os.path.isdir(ep_dir):
             return []
+        # FIX: was ".replay.png" which misses ".replay-abc123.png"
         files = sorted(f for f in os.listdir(ep_dir)
-                       if f.endswith(".png") and not f.endswith(".replay.png"))
+                       if f.endswith(".png") and ".replay-" not in f)
         out = []
         for fn in files:
             try:
@@ -1763,8 +1731,9 @@ class StormArchiver:
             for d in dirs:
                 ep_dir = os.path.join(self.root_dir, d)
                 meta = _load_json_file(os.path.join(ep_dir, "event.json"))
+                # FIX: same filter fix as load_episode_frames
                 raw_files = sorted(f for f in os.listdir(ep_dir)
-                                   if f.endswith(".png") and not f.endswith(".replay.png"))
+                                   if f.endswith(".png") and ".replay-" not in f)
                 if meta:
                     meta["frame_count"] = len(raw_files)
                     meta["frames"] = raw_files
@@ -1970,6 +1939,41 @@ def _sample_radar_at_view(gray, radar_mask, radar_mmh, calib, target_lat, target
     return gray_out, mask_out, mmh_out
 
 
+def _sample_raw_at_view(raw_rgb, calib, target_lat, target_lon,
+                        radius_km, view_rot, out_w, out_h):
+    """Sample a raw RGB frame (DHMZ's own colours) at output view coordinates.
+
+    Returns (H, W, 3) uint8 array, plus a valid mask indicating which output
+    pixels fell inside the raw frame's bounds.
+    """
+    H, W = out_h, out_w
+    xs = np.arange(W, dtype=np.float32) - W / 2.0
+    ys = -(np.arange(H, dtype=np.float32) - H / 2.0)
+    X, Y = np.meshgrid(xs, ys)
+    kpp_x = 2.0 * radius_km / W
+    kpp_y = 2.0 * radius_km / H
+    dx_km = X * kpp_x
+    dy_km = Y * kpp_y
+    rot_rad = math.radians(view_rot)
+    c, s = math.cos(rot_rad), math.sin(rot_rad)
+    world_dx = dx_km * c + dy_km * s
+    world_dy = -dx_km * s + dy_km * c
+    lat = target_lat + world_dy / 111.32
+    coslat = math.cos(math.radians(target_lat))
+    lon = target_lon + world_dx / (111.32 * coslat)
+    inv = calib._inv
+    lat_c = calib.coef_lat[2]; lon_c = calib.coef_lon[2]
+    radar_x = inv[0, 0] * (lat - lat_c) + inv[0, 1] * (lon - lon_c) + calib.map_region.x0
+    radar_y = inv[1, 0] * (lat - lat_c) + inv[1, 1] * (lon - lon_c) + calib.map_region.y0
+    rx = np.round(radar_x).astype(np.int32)
+    ry = np.round(radar_y).astype(np.int32)
+    valid = ((rx >= 0) & (rx < raw_rgb.shape[1])
+             & (ry >= 0) & (ry < raw_rgb.shape[0]))
+    out = np.zeros((H, W, 3), dtype=np.uint8)
+    out[valid] = raw_rgb[ry[valid], rx[valid]]
+    return out, valid
+
+
 def _latlon_to_overlay_px(calib, target_lat, target_lon, radius_km, size_px,
                           view_rot, lat, lon):
     coslat = math.cos(math.radians(target_lat))
@@ -2049,12 +2053,6 @@ def _draw_text_outlined(draw, x, y, text, fill, outline):
             if dx == 0 and dy == 0: continue
             draw.text((x + dx, y + dy), text, fill=outline)
     draw.text((x, y), text, fill=fill)
-
-
-def _draw_cross(draw, cx, cy, arm, color, width=2):
-    cx, cy = int(round(cx)), int(round(cy))
-    draw.line([(cx - arm, cy), (cx + arm, cy)], fill=color, width=width)
-    draw.line([(cx, cy - arm), (cx, cy + arm)], fill=color, width=width)
 
 
 def _draw_arrow(draw, x0, y0, x1, y1, color, outline=(0, 0, 0)):
@@ -2155,7 +2153,7 @@ def _draw_legend(pil_img, confirm_mm):
 def compose_map(radar_mask, radar_mmh, gray, calib, target_lat, target_lon,
                 radius_km, view_rot, size_px, basemap_img, basemap_kind,
                 clusters, arrivals, stations, show_cities,
-                intensity_mode, rt, confirm_mm=0.2):
+                intensity_mode, rt, confirm_mm=0.2, raw_frame=None):
     gray_out, mask_out, mmh_out = _sample_radar_at_view(
         gray, radar_mask, radar_mmh, calib, target_lat, target_lon,
         radius_km, view_rot, size_px, size_px)
@@ -2182,6 +2180,19 @@ def compose_map(radar_mask, radar_mmh, gray, calib, target_lat, target_lon,
         else:
             rgb[mask_out] = color[mask_out]
 
+    # Fit-check overlay: raw DHMZ frame at 30% opacity, drawn on top of the
+    # composite so DHMZ's own coastlines and land/sea contrast are visible for
+    # comparison with the satellite basemap. Only rendered when the runtime
+    # toggle is on.
+    if raw_frame is not None and rt.get("fit_check_overlay", False):
+        raw_rgb = np.asarray(raw_frame.convert("RGB"), dtype=np.uint8)
+        raw_view, _ = _sample_raw_at_view(
+            raw_rgb, calib, target_lat, target_lon, radius_km, view_rot,
+            size_px, size_px)
+        alpha_raw = 0.30
+        rgb = (rgb.astype(np.float32) * (1 - alpha_raw)
+               + raw_view.astype(np.float32) * alpha_raw).astype(np.uint8)
+
     if basemap_kind != "mapbox":
         _draw_coast_overlay(rgb, calib, target_lat, target_lon,
                             radius_km, view_rot, size_px)
@@ -2204,9 +2215,6 @@ def compose_map(radar_mask, radar_mmh, gray, calib, target_lat, target_lon,
     pil = Image.fromarray(rgb.astype(np.uint8))
     draw = ImageDraw.Draw(pil)
 
-    # Arrows: gated by coherence. A cluster whose per-pixel flow disagrees
-    # (coherence < 0.4) is deforming — the median vector is not physically
-    # meaningful, so don't draw an arrow at all.
     for a in arrivals:
         if a.coherence < 0.4:
             continue
@@ -2246,53 +2254,6 @@ def compose_map(radar_mask, radar_mmh, gray, calib, target_lat, target_lon,
     return pil
 
 
-def render_raw_diagnostic(frame, calib, target_lat, target_lon, size_px=720):
-    """Raw DHMZ frame with calibration markers in DHMZ pixel space.
-
-    What you should see:
-      * Yellow circles + labels on anchor cities at their DHMZ pixel positions.
-      * Magenta crosshair for the target (Zadar or wherever configured). If
-        this lands on the correct geographic spot in the raw DHMZ image, the
-        calibration is good.
-      * 100-px reference grid.
-    """
-    pil = frame.convert("RGB").copy()
-    W, H = pil.size
-    if W != size_px or H != size_px:
-        scale_x = size_px / W
-        scale_y = size_px / H
-        pil = pil.resize((size_px, size_px), Image.LANCZOS)
-    else:
-        scale_x = scale_y = 1.0
-    draw = ImageDraw.Draw(pil)
-    for gx in range(0, size_px, 100):
-        draw.line([(gx, 0), (gx, size_px)], fill=(60, 60, 60), width=1)
-    for gy in range(0, size_px, 100):
-        draw.line([(0, gy), (size_px, gy)], fill=(60, 60, 60), width=1)
-    for label, lat, lon in calib.anchor_cities:
-        ix, iy = calib.latlon_to_image_pixel(lat, lon)
-        ix *= scale_x; iy *= scale_y
-        if 0 <= ix < size_px and 0 <= iy < size_px:
-            draw.ellipse([ix - 5, iy - 5, ix + 5, iy + 5],
-                         outline=(255, 255, 0), width=2)
-            _draw_text_outlined(draw, ix + 8, iy - 6, label,
-                                (255, 255, 0), (0, 0, 0))
-    ix_t, iy_t = calib.latlon_to_image_pixel(target_lat, target_lon)
-    ix_t *= scale_x; iy_t *= scale_y
-    if 0 <= ix_t < size_px and 0 <= iy_t < size_px:
-        _draw_cross(draw, ix_t, iy_t, 16, (255, 50, 255), width=2)
-        draw.ellipse([ix_t - 8, iy_t - 8, ix_t + 8, iy_t + 8],
-                     outline=(255, 50, 255), width=1)
-        _draw_text_outlined(draw, ix_t + 18, iy_t - 6,
-                            f"target ({target_lat:.3f},{target_lon:.3f})",
-                            (255, 50, 255), (0, 0, 0))
-    _draw_text_outlined(draw, 10, 8, "RAW DHMZ frame — fit check",
-                        (255, 220, 60), (0, 0, 0))
-    buf = io.BytesIO()
-    pil.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
-
-
 def render_composed_png(frame, calib, target_lat, target_lon, radius_km,
                         view_rot, size_px, basemap_img, basemap_kind,
                         clusters, arrivals, stations, show_cities,
@@ -2305,7 +2266,8 @@ def render_composed_png(frame, calib, target_lat, target_lon, radius_km,
     pil = compose_map(mask, mmh, gray, calib, target_lat, target_lon,
                       radius_km, view_rot, size_px, basemap_img, basemap_kind,
                       clusters, arrivals, stations, show_cities,
-                      intensity_mode, rt, confirm_mm=confirm_mm)
+                      intensity_mode, rt, confirm_mm=confirm_mm,
+                      raw_frame=frame)
     if header_text:
         draw = ImageDraw.Draw(pil)
         _draw_text_outlined(draw, 10, 8, header_text, (255, 220, 60), (0, 0, 0))
@@ -2337,7 +2299,8 @@ def render_composed_gif(frames, flows, calib, target_lat, target_lon, radius_km,
         pil = compose_map(mask, mmh, gray, calib, target_lat, target_lon,
                           radius_km, view_rot, size_px, basemap_img, basemap_kind,
                           [a.cluster for a in arrivals], arrivals, stations,
-                          show_cities, intensity_mode, rt, confirm_mm=confirm_mm)
+                          show_cities, intensity_mode, rt, confirm_mm=confirm_mm,
+                          raw_frame=frame)
         out.append(pil)
     if not out:
         return None
@@ -3170,622 +3133,12 @@ def _replay_cache_put(key, data):
 
          
 # ============================================================================
-# SECTION 23 — Web UI
-#   23.1  _INDEX_HTML       dashboard template
-#   23.2  _REPLAY_HTML      replay template
-#   23.3  _VizHandler       HTTP handler (routes + per-endpoint bodies)
-#   23.4  start_web         server bootstrap
-# ============================================================================
-
-# ---------------------------------------------------------------- 23.1 -----
-_INDEX_HTML = """<!DOCTYPE html><html><head><title>DHMZ Radar Nowcaster</title>
-<style>
-body{background:#111;color:#ddd;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:20px}
-h1{color:#fff;margin-top:0;display:flex;align-items:center;gap:12px;flex-wrap:wrap}.layout{display:flex;gap:20px;flex-wrap:wrap}
-.left{flex:1 1 470px;max-width:580px}.right{flex:2 1 600px}
-.section{background:#1a1a1a;border:1px solid #333;border-radius:4px;padding:12px;margin-bottom:12px}
-.section h3{margin:0 0 8px 0;font-size:13px;text-transform:uppercase;color:#5cf;letter-spacing:0.5px;display:flex;justify-content:space-between;align-items:center}
-.field{display:flex;align-items:center;margin-bottom:6px;font-size:13px}
-.field label{flex:1;color:#ccc}.field input[type=number]{width:90px;background:#0a0a0a;color:#ddd;border:1px solid #333;padding:4px;border-radius:3px}
-.field input[type=text]{flex:0 0 160px;background:#0a0a0a;color:#ddd;border:1px solid #333;padding:4px;border-radius:3px}
-.field select{width:130px;background:#0a0a0a;color:#ddd;border:1px solid #333;padding:4px;border-radius:3px}
-.field input[type=checkbox]{accent-color:#5cf;width:18px;height:18px}
-.actions{margin-top:8px;display:flex;gap:8px;flex-wrap:wrap}
-button{background:#2a5c8a;color:#fff;border:0;padding:7px 12px;border-radius:3px;cursor:pointer;font-size:12px}
-button:hover{background:#3a7cba}button.secondary{background:#444}
-button.secondary:hover{background:#555}button.danger{background:#8a2a2a}
-button.danger:hover{background:#ba3a3a}
-.status{background:#1a1a1a;border:1px solid #333;border-radius:4px;padding:12px;margin-bottom:12px;font-size:13px}
-.status .row{display:flex;margin-bottom:4px}.status .label{color:#888;flex:0 0 160px}
-.wx-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
-.wx-box{background:#121519;border:1px solid #282c34;border-radius:4px;padding:7px 8px}
-.wx-k{font-size:11px;color:#888;text-transform:uppercase}
-.wx-v{font-size:15px;font-weight:600;color:#fff;margin-top:2px;font-variant-numeric:tabular-nums}
-.wx-sub{font-size:11px;color:#9aa}
-table.acc{width:100%;border-collapse:collapse;font-size:12px}
-table.acc th,table.acc td{padding:4px 6px;text-align:left;border-bottom:1px solid #252830}
-table.acc th{color:#5cf;font-weight:normal;text-transform:uppercase;font-size:11px}
-table.acc td.num{text-align:right;font-variant-numeric:tabular-nums}
-img{max-width:100%;border:1px solid #333;display:block;margin-bottom:12px}
-a{color:#5cf}.hint{color:#778;font-size:11px;margin-top:4px}
-.cfgpath{font-family:monospace;color:#7c7}
-.badge{background:#244866;color:#9df;padding:3px 8px;border-radius:3px;font-size:12px;text-decoration:none}
-</style></head><body>
-<h1>DHMZ Radar Nowcaster <a class="badge" href="/replay">Offline Replay →</a></h1>
-<p><a href="/threat.gif">/threat.gif</a> · <a href="/threat.png">/threat.png</a> · <a href="/threat-raw.png">/threat-raw.png</a> (fit check) · <a href="/status">/status</a> · <a href="/settings">/settings</a> · <a href="/config">/config</a> · <a href="/archive">/archive</a> · <a href="/accuracy">/accuracy</a></p>
-<div class="layout">
-<div class="left">
-<div class="status" id="status">Loading...</div>
-<div class="section"><h3>Local Weather (Pljusak)</h3>
-<div id="local_wx">Loading...</div>
-</div>
-<div class="section"><h3>Storm Frame Archive</h3>
-<div id="archive_box">Loading...</div>
-</div>
-<div class="section"><h3>Accuracy</h3>
-<div id="accuracy">Loading...</div>
-<div class="actions" style="margin-top:8px">
-<button class="secondary" onclick="replayAccuracy()">Replay scores</button>
-<button class="danger" onclick="resetAccuracy()">Reset scores</button>
-</div></div>
-<div class="section"><h3>Sensors (HA)</h3>
-<div id="sensors">Loading...</div>
-</div>
-<div class="section"><h3>Runtime settings (hot)</h3>
-<div class="field"><label>Focus radius (km)</label><input type="number" id="focus_radius_km" min="20" max="1000" step="10"></div>
-<div class="field"><label>Threat radius (km)</label><input type="number" id="threat_radius_km" min="1" max="500" step="5"></div>
-<div class="field"><label>Arrival pixel threshold</label><input type="number" id="arrival_pixel_threshold" min="1" max="5000" step="5"></div>
-<div class="field"><label>Departure pixel threshold</label><input type="number" id="departure_pixel_threshold" min="1" max="5000" step="5"></div>
-<div class="field"><label>Max horizon (min)</label><input type="number" id="max_horizon_min" min="30" max="360" step="10"></div>
-<div class="field"><label>Min cell size (px)</label><input type="number" id="min_size_px" min="5" max="5000" step="5"></div>
-<div class="field"><label>Map radius (km)</label><input type="number" id="radius_km" min="20" max="1000" step="10"></div>
-<div class="field"><label>Local weather radius (km)</label><input type="number" id="weather_radius_km" min="0.5" max="100" step="0.5"></div>
-<div class="field"><label>Archive frames</label><input type="checkbox" id="archive_enabled"></div>
-<div class="field"><label>Archive radius (km)</label><input type="number" id="archive_radius_km" min="20" max="500" step="10"></div>
-<div class="field"><label>Precompute replay PNGs</label><input type="checkbox" id="archive_precompute_replay"></div>
-<div class="field"><label>View rotation: auto</label><input type="checkbox" id="view_rotation_auto"></div>
-<div class="field"><label>View rotation (° CW, up)</label><input type="number" id="view_rotation" min="0" max="360" step="5"></div>
-<div class="field"><label>Basemap</label>
-<select id="basemap">
-<option value="auto">auto</option><option value="mapbox">mapbox</option>
-<option value="greyscale">greyscale</option><option value="none">none</option>
-</select></div>
-<div class="field"><label>Basemap saturation</label><input type="number" id="basemap_saturation" min="0" max="2" step="0.1"></div>
-<div class="field"><label>Basemap brightness</label><input type="number" id="basemap_brightness" min="0.2" max="2" step="0.05"></div>
-<div class="field"><label>Basemap contrast</label><input type="number" id="basemap_contrast" min="0.2" max="2" step="0.05"></div>
-<div class="field"><label>Cities</label><input type="checkbox" id="show_cities"></div>
-<div class="field"><label>Poll interval (s)</label><input type="number" id="poll_s" min="30" max="7200" step="30"></div>
-<div class="field"><label>Image scale</label><input type="number" id="web_scale" min="0.1" max="4" step="0.1"></div>
-<div class="field"><label>Settings tag</label><input type="text" id="settings_tag"></div>
-<div class="actions">
-<button onclick="saveAll(false)">Save</button>
-<button onclick="saveAll(true)">Save & refresh</button>
-</div></div>
-</div>
-<div class="right">
-<img id="g" src="/threat.gif">
-<img id="p" src="/threat.png">
-</div>
-</div>
-<script>
-const RT_FIELDS=['focus_radius_km','threat_radius_km','arrival_pixel_threshold','departure_pixel_threshold','max_horizon_min','min_size_px','radius_km','weather_radius_km','archive_enabled','archive_radius_km','archive_precompute_replay','view_rotation_auto','view_rotation','basemap','basemap_saturation','basemap_brightness','basemap_contrast','show_cities','poll_s','web_scale','settings_tag'];
-const MAIN_SENSORS=['raining_now','raining_confirmed','rain_confidence','rain_duration_min','rain_end_eta_min','next_rain_eta_min','gap_min','summary','radar_intensity_mmh','nearest_station_mm','intensity_mmh','station_trend','local_temp_c','local_humidity','local_pressure_hpa','local_wind_speed_kmh','local_wind_gust_kmh','local_wind_dir','local_rain_today_mm','local_rain_1h_mm','local_rain_rate_mmh'];
-const DIAG_SENSORS=['nowcast_error_min','data_age_min','frame_timestamp','cluster_count','nearest_cell_eta_min','nearest_station_km','nearest_station_age_min','station_count_wet','station_count_fresh','station_wet_fraction','station_median_mm','local_weather_stations'];
-function setField(k,v){const el=document.getElementById(k);if(!el)return;if(el.type==='checkbox')el.checked=!!v;else el.value=v;}
-function getField(k){const el=document.getElementById(k);if(!el)return null;if(el.type==='checkbox')return el.checked;if(k==='settings_tag'||k==='basemap')return el.value;return parseFloat(el.value);}
-function loadSettings(){fetch('/settings').then(r=>r.json()).then(s=>{RT_FIELDS.forEach(k=>{if(k in s)setField(k,s[k]);});});}
-function saveAll(refresh){const body={};RT_FIELDS.forEach(k=>body[k]=getField(k));
- fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
- .then(r=>r.json()).then(d=>{if(d.ok&&refresh)return fetch('/refresh',{method:'POST'});})
- .then(()=>{bumpImages();loadStatus();});}
-function fmtVal(v){if(v===null||v===undefined)return '—';if(typeof v==='boolean')return v?'yes':'no';return String(v);}
-function loadStatus(){fetch('/status').then(r=>r.json()).then(s=>{const el=document.getElementById('status');if(!s||!s.updated){el.textContent='No data yet';return;}
- el.innerHTML=`<div class="row"><span class="label">Target</span><span>${s.target||'?'}</span></div>
- <div class="row"><span class="label">Updated</span><span>${s.updated}</span></div>
- <div class="row"><span class="label">Confidence</span><span>${s.confidence||'?'}</span></div>
- <div class="row"><span class="label">Raining</span><span>${s.raining_now?'yes':'no'}</span></div>
- <div class="row"><span class="label">Nowcast</span><span>${s.summary||'—'}</span></div>
- <div class="row"><span class="label">View rotation</span><span>${s.view_rotation_used!=null?s.view_rotation_used.toFixed(0)+'°'+(s.view_rotation_auto?' (auto)':'') :'—'}</span></div>
- <div class="row"><span class="label">Basemap</span><span>${s.basemap_used||'—'}</span></div>
- <div class="row"><span class="label">Config</span><span class="cfgpath">${s.config_path||'(not persisted)'}</span></div>`;
- const arch=s.archive||{};
- const archEl=document.getElementById('archive_box');
- if(!arch.archive_dir){archEl.innerHTML='<div class="hint">Persistence disabled (no data-dir)</div>';}
- else{archEl.innerHTML=`<div class="hint">Status: ${arch.enabled?'Active':'Paused'} (≤${arch.radius_km||100} km) · Episodes: <b>${arch.total_episodes||0}</b> · Frames: <b>${arch.total_frames||0}</b> · Replays: <b>${arch.total_replays||0}</b></div>
- <div class="hint">Last episode: <span class="cfgpath">${arch.last_episode||'none'}</span> · <a href="/replay">Open Replay</a></div>`;}
- const wx=s.local_weather||{};
- const wxEl=document.getElementById('local_wx');
- if(!wx.station_count){wxEl.innerHTML=`<div class="hint">No fresh Pljusak stations within ${wx.radius_km||5} km</div>`;}
- else{const windTxt=wx.wind_speed_kmh!=null?`${wx.wind_speed_kmh} km/h`:'—';
-  const gustTxt=wx.wind_gust_kmh!=null?`gust ${wx.wind_gust_kmh}`:'';
-  const dirTxt=wx.wind_dir_deg!=null?`${wx.wind_dir_cardinal} (${wx.wind_dir_deg}°)`:'—';
-  const pTrend=wx.pressure_trend!=null?(wx.pressure_trend>0?'+':'')+wx.pressure_trend+' hPa':'';
-  const tTrend=wx.temp_trend!=null?(wx.temp_trend>0?'+':'')+wx.temp_trend+'°/h':'';
-  wxEl.innerHTML=`<div class="wx-grid">
-   <div class="wx-box"><div class="wx-k">Temp</div><div class="wx-v">${wx.temp_c!=null?wx.temp_c+' °C':'—'}</div><div class="wx-sub">${tTrend||' '}</div></div>
-   <div class="wx-box"><div class="wx-k">Humidity</div><div class="wx-v">${wx.humidity_pct!=null?wx.humidity_pct+' %':'—'}</div></div>
-   <div class="wx-box"><div class="wx-k">Pressure</div><div class="wx-v">${wx.pressure_hpa!=null?wx.pressure_hpa+' hPa':'—'}</div><div class="wx-sub">${pTrend||' '}</div></div>
-   <div class="wx-box"><div class="wx-k">Wind</div><div class="wx-v">${windTxt}</div><div class="wx-sub">${gustTxt||' '}</div></div>
-   <div class="wx-box"><div class="wx-k">Heading</div><div class="wx-v">${dirTxt}</div></div>
-   <div class="wx-box"><div class="wx-k">Rain (Today / 1h)</div><div class="wx-v">${wx.precip_today_mm!=null?wx.precip_today_mm:'—'} / ${wx.precip_1h_mm!=null?wx.precip_1h_mm:'—'} mm</div><div class="wx-sub">${wx.rain_rate_mmh!=null?wx.rain_rate_mmh+' mm/h':' '}</div></div>
-  </div>
-  <div class="hint" style="margin-top:6px">${wx.station_count} fresh ≤ ${wx.radius_km} km · nearest: ${wx.nearest_station||'?'} (${wx.nearest_dist_km} km)</div>`;}
- const sensors=s.sensors||{};
- let html='<table class="acc"><tr><th>Sensor</th><th>Value</th></tr>';
- for(const k of MAIN_SENSORS){html+=`<tr><td>${k}</td><td class="num">${fmtVal(sensors[k])}</td></tr>`;}
- html+='</table><h4>Diagnostic</h4><table class="acc">';
- for(const k of DIAG_SENSORS){html+=`<tr><td>${k}</td><td class="num">${fmtVal(sensors[k])}</td></tr>`;}
- html+='</table>';
- document.getElementById('sensors').innerHTML=html;
-});}
-function loadAccuracy(){fetch('/accuracy').then(r=>r.json()).then(a=>{const el=document.getElementById('accuracy');
- if(!a){el.innerHTML='<div class="hint">No accuracy data</div>';return;}
- let html='<div class="hint">Preds '+a.total_predictions+' · Outcomes '+a.total_outcomes+' · Scores '+a.total_scores+' · Expired '+(a.expired_predictions||0)+' · Superseded '+(a.superseded_predictions||0)+'</div>';
- const pend=a.pending_by_kind||{};
- if(Object.keys(pend).length){html+='<div class="hint">Pending: '+Object.entries(pend).map(([k,v])=>k+':'+v).join(', ')+'</div>';}
- if(a.total_scores>0){const order=['cluster_arrive','rain_start','rain_end','threat'];
-  html+='<table class="acc"><tr><th>Kind</th><th>N</th><th>Median err</th><th>Median abs</th><th>Mean abs</th><th>p90 abs</th></tr>';
-  for(const k of order){const v=a.by_kind[k];if(!v||!v.n)continue;
-   const bias=v.median_error_min!=null?(v.median_error_min>0?'+':'')+v.median_error_min.toFixed(0):'—';
-   html+=`<tr><td>${k}</td><td class="num">${v.n}</td><td class="num">${bias}</td><td class="num">${v.median_abs_error_min.toFixed(1)}</td><td class="num">${v.mean_abs_error_min.toFixed(1)}</td><td class="num">${v.p90_abs_error_min.toFixed(1)}</td></tr>`;}
-  html+='</table>';
-  const tags=Object.keys(a.by_tag||{});
-  if(tags.length){html+='<h4>By tag</h4><table class="acc"><tr><th>Tag</th><th>N</th><th>Median abs</th></tr>';
-   for(const t of tags){const v=a.by_tag[t];if(!v||!v.n)continue;
-    html+=`<tr><td>${t||'(untagged)'}</td><td class="num">${v.n}</td><td class="num">${v.median_abs_error_min.toFixed(1)}</td></tr>`;}
-   html+='</table>';}}
- el.innerHTML=html;
-});}
-function replayAccuracy(){if(!confirm('Re-score all predictions?'))return;fetch('/accuracy/replay',{method:'POST'}).then(()=>loadAccuracy());}
-function resetAccuracy(){if(!confirm('Clear all scores?'))return;fetch('/accuracy/reset',{method:'POST'}).then(()=>loadAccuracy());}
-function bumpImages(){const t=Date.now();document.getElementById('g').src='/threat.gif?t='+t;document.getElementById('p').src='/threat.png?t='+t;}
-loadSettings();loadStatus();loadAccuracy();
-setInterval(loadStatus,10000);setInterval(loadAccuracy,30000);setInterval(bumpImages,60000);
-</script></body></html>"""
-
-
-# ---------------------------------------------------------------- 23.2 -----
-_REPLAY_HTML = """<!DOCTYPE html><html><head><title>Offline Replay — DHMZ Radar</title>
-<style>
-body{background:#0e1014;color:#dde;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:18px}
-h1{color:#fff;margin:0 0 12px 0;font-size:20px;display:flex;align-items:center;gap:12px}
-.badge{background:#233547;color:#7cf;padding:3px 8px;border-radius:3px;font-size:12px;text-decoration:none}
-.grid{display:flex;gap:18px;flex-wrap:wrap}
-.col-left{flex:1 1 520px;max-width:760px}
-.col-right{flex:1 1 320px;max-width:420px}
-.card{background:#161a20;border:1px solid #2b323d;border-radius:5px;padding:12px;margin-bottom:14px}
-.card h3{margin:0 0 8px 0;font-size:12px;text-transform:uppercase;color:#6cf;letter-spacing:0.6px}
-.row{display:flex;align-items:center;gap:8px;margin-bottom:7px;font-size:13px}
-.row label{flex:1;color:#bcc}
-button{background:#265b8c;color:#fff;border:0;padding:7px 12px;border-radius:3px;cursor:pointer;font-size:12px;font-weight:500}
-button:hover{background:#3477b5}
-button.secondary{background:#383f4a}button.secondary:hover{background:#4a5362}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th,td{padding:5px 6px;text-align:left;border-bottom:1px solid #242a34}
-th{color:#7cf;font-size:11px;text-transform:uppercase;font-weight:500}
-td.num{text-align:right;font-variant-numeric:tabular-nums}
-.scrubber{display:flex;align-items:center;gap:8px;margin-top:8px}
-.scrubber input[type=range]{flex:1;accent-color:#6cf}
-img#replay_img{width:100%;max-width:720px;border:1px solid #2b323d;border-radius:4px;display:block;background:#080a0d}
-.hint{color:#778;font-size:11px;margin-top:4px;line-height:1.4}
-</style></head><body>
-<h1>Offline Replay <a class="badge" href="/">← Live Dashboard</a></h1>
-
-<div class="grid">
-  <div class="col-left">
-    <div class="card">
-      <h3>Archived Storm Episode</h3>
-      <div class="row">
-        <label>Episode</label>
-        <select id="ep_select" onchange="onEpisodeChange()" style="flex:1;background:#0b0d10;color:#eee;border:1px solid #333b48;padding:4px 6px;border-radius:3px"></select>
-        <button class="secondary" onclick="loadEpisodes()">Reload</button>
-      </div>
-      <div id="ep_meta" class="hint">Loading archived episodes...</div>
-      <div class="scrubber">
-        <button class="secondary" onclick="stepFrame(-1)">◀</button>
-        <button id="play_btn" class="secondary" onclick="togglePlay()">▶ Play</button>
-        <button class="secondary" onclick="stepFrame(1)">▶</button>
-        <input type="range" id="frame_slider" min="0" max="0" value="0" oninput="renderFrame()">
-        <span id="frame_lbl" style="font-size:12px;min-width:52px;text-align:right">0/0</span>
-      </div>
-      <div class="hint" style="margin-top:6px">
-        Images are precomputed at archive time — should load instantly.
-      </div>
-    </div>
-    <img id="replay_img" alt="Archived radar frame">
-  </div>
-
-  <div class="col-right">
-    <div class="card">
-      <h3>Episodes</h3>
-      <div id="episodes_box" class="hint">Loading...</div>
-    </div>
-    <div class="card">
-      <h3>Tips</h3>
-      <div class="hint">
-        Play runs at ~2 fps. Frames with precomputed replays load instantly
-        (browser-cached). If you see a spinner, that frame is being rendered
-        on-demand — usually because the archive-time params differ from now.
-      </div>
-    </div>
-  </div>
-</div>
-
-<script>
-let episodes=[];
-let playTimer=null;
-
-function loadEpisodes(){
-  fetch('/archive?n=50').then(r=>r.json()).then(d=>{
-    episodes=d.episodes||[];
-    const sel=document.getElementById('ep_select');
-    sel.innerHTML='';
-    if(!episodes.length){
-      document.getElementById('ep_meta').textContent='No archived storm episodes yet.';
-      document.getElementById('episodes_box').textContent='No episodes.';
-      return;
-    }
-    episodes.forEach(ep=>{
-      const opt=document.createElement('option');
-      opt.value=ep.episode_id;
-      opt.textContent=`${ep.episode_id} (${ep.frame_count} fr, peak ${ep.peak_sri_mmh||'?'} mm/h${ep.target_hit?' · HIT':''})`;
-      sel.appendChild(opt);
-    });
-    let html='<table><tr><th>Episode</th><th class="num">Frames</th><th class="num">Peak</th><th>Hit</th></tr>';
-    episodes.forEach(ep=>{
-      html+=`<tr><td>${ep.episode_id}</td><td class="num">${ep.frame_count||0}</td><td class="num">${ep.peak_sri_mmh||'—'}</td><td>${ep.target_hit?'✓':'—'}</td></tr>`;
-    });
-    html+='</table>';
-    document.getElementById('episodes_box').innerHTML=html;
-    onEpisodeChange();
-  });
-}
-
-function onEpisodeChange(){
-  const epId=document.getElementById('ep_select').value;
-  const ep=episodes.find(e=>e.episode_id===epId);
-  const slider=document.getElementById('frame_slider');
-  if(!ep)return;
-  const maxIdx=Math.max(0,(ep.frame_count||1)-1);
-  slider.max=maxIdx;
-  slider.value=maxIdx;
-  document.getElementById('ep_meta').textContent=`Start: ${ep.start_utc||'?'} · End: ${ep.end_utc||'?'} · Peak SRI: ${ep.peak_sri_mmh||0} mm/h`;
-  renderFrame();
-}
-
-function stepFrame(delta){
-  const slider=document.getElementById('frame_slider');
-  const next=Math.max(0,Math.min(parseInt(slider.max),parseInt(slider.value)+delta));
-  slider.value=next;
-  renderFrame();
-}
-
-function togglePlay(){
-  const btn=document.getElementById('play_btn');
-  if(playTimer){clearInterval(playTimer);playTimer=null;btn.textContent='▶ Play';return;}
-  btn.textContent='⏸ Pause';
-  playTimer=setInterval(()=>{
-    const slider=document.getElementById('frame_slider');
-    let v=parseInt(slider.value)+1;
-    if(v>parseInt(slider.max))v=0;
-    slider.value=v;
-    renderFrame();
-  },450);
-}
-
-function renderFrame(){
-  const epId=document.getElementById('ep_select').value;
-  const slider=document.getElementById('frame_slider');
-  const idx=parseInt(slider.value)||0;
-  const total=parseInt(slider.max)+1;
-  document.getElementById('frame_lbl').textContent=`${idx+1}/${total}`;
-  if(!epId)return;
-  document.getElementById('replay_img').src=`/replay/frame?episode=${encodeURIComponent(epId)}&idx=${idx}`;
-}
-
-loadEpisodes();
-</script></body></html>"""
-
-
-# ---------------------------------------------------------------- 23.3 -----
-class _VizHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        path = self.path.split("?")[0]
-        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
-        params = {}
-        for part in qs.split("&"):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                params[k] = v
-        if path == "/":
-            self._html(_INDEX_HTML)
-        elif path == "/replay":
-            self._html(_REPLAY_HTML)
-        elif path == "/replay/frame":
-            self._replay_frame(params)
-        elif path == "/threat.png":
-            self._bytes("png", "image/png")
-        elif path == "/threat.gif":
-            self._bytes("gif", "image/gif")
-        elif path == "/threat-raw.png":
-            self._raw_diagnostic()
-        elif path == "/status":
-            self._status()
-        elif path == "/settings":
-            self._json(_snapshot())
-        elif path == "/config":
-            self._config_get()
-        elif path == "/archive":
-            self._archive(params)
-        elif path == "/accuracy":
-            self._accuracy(params)
-        elif path == "/accuracy/predictions":
-            self._accuracy_predictions(params)
-        elif path == "/accuracy/events":
-            self._accuracy_events(params)
-        else:
-            self.send_response(404); self.end_headers()
-
-    def do_POST(self):
-        path = self.path.split("?")[0]
-        if path == "/settings":
-            self._settings_post()
-        elif path == "/config":
-            self._config_post()
-        elif path == "/refresh":
-            _FORCE_REFRESH.set()
-            self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
-        elif path == "/accuracy/reset":
-            acc = _VIZ_STATE.get("acc_store")
-            if acc: acc.reset_scores()
-            self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
-        elif path == "/accuracy/replay":
-            acc = _VIZ_STATE.get("acc_store")
-            if acc: acc.replay()
-            self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
-        else:
-            self.send_response(404); self.end_headers()
-
-    def do_DELETE(self):
-        path = self.path.split("?")[0]
-        if path == "/config":
-            cfg_path = _VIZ_STATE.get("config_path")
-            if cfg_path:
-                for p in (cfg_path, cfg_path + ".bak"):
-                    try: os.remove(p)
-                    except FileNotFoundError: pass
-            self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
-        else:
-            self.send_response(404); self.end_headers()
-
-    def _read_json_body(self):
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            return json.loads(self.rfile.read(length)) if length > 0 else {}
-        except Exception:
-            return None
-
-    def _json(self, obj, code=200):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers(); self.wfile.write(body)
-
-    def _bytes(self, key, ctype):
-        with _VIZ_STATE["lock"]:
-            data = _VIZ_STATE[key]
-        if data is None:
-            self.send_response(503); self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", "9"); self.end_headers()
-            self.wfile.write(b"not ready"); return
-        self.send_response(200); self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-cache, max-age=0")
-        self.end_headers(); self.wfile.write(data)
-
-    def _raw_diagnostic(self):
-        frame = _VIZ_STATE.get("raw_frame")
-        calib = _VIZ_STATE.get("calib")
-        if frame is None or calib is None:
-            self.send_response(503)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", "9")
-            self.end_headers()
-            self.wfile.write(b"not ready")
-            return
-        target = _VIZ_STATE.get("target") or (0.0, 0.0)
-        try:
-            out = render_raw_diagnostic(
-                frame, calib, target[0], target[1],
-                size_px=(_static_snapshot().get("basemap_size") or 720))
-        except Exception as e:
-            print(f"raw diagnostic error: {e}", file=sys.stderr)
-            self.send_response(500); self.end_headers(); return
-        self.send_response(200)
-        self.send_header("Content-Type", "image/png")
-        self.send_header("Content-Length", str(len(out)))
-        self.send_header("Cache-Control", "no-cache, max-age=0")
-        self.end_headers()
-        self.wfile.write(out)
-
-    def _status(self):
-        with _VIZ_STATE["lock"]:
-            status = dict(_VIZ_STATE["status"])
-        status["config_path"] = _VIZ_STATE.get("config_path")
-        self._json(status)
-
-    def _archive(self, params):
-        arch = _VIZ_STATE.get("archiver")
-        if not arch:
-            self._json({"enabled": False, "episodes": []}); return
-        limit = int(params.get("n", 30))
-        res = arch.summary()
-        res["episodes"] = arch.list_episodes(limit=limit)
-        self._json(res)
-
-    def _replay_frame(self, params):
-        import urllib.parse
-        eng = _VIZ_STATE.get("replay_engine")
-        arch = _VIZ_STATE.get("archiver")
-        if not eng:
-            self.send_response(503); self.end_headers(); return
-        ep_id = urllib.parse.unquote(params.get("episode", ""))
-        try:
-            idx = int(params.get("idx", 0))
-        except (ValueError, TypeError):
-            idx = 0
-
-        data = eng.get_episode_data(ep_id)
-        if not data:
-            self.send_response(404); self.end_headers(); return
-        idx = max(0, min(len(data) - 1, idx))
-        rt = _snapshot()
-        st = _static_snapshot()
-
-        # Fast path: precomputed replay PNG
-        if arch is not None:
-            _, fpath, fname = data[idx]
-            ph = _replay_params_hash(rt, st)
-            precomputed = arch.find_replay_png(ep_id, fname, ph)
-            if precomputed is not None:
-                try:
-                    with open(precomputed, "rb") as fh:
-                        out = fh.read()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "image/png")
-                    self.send_header("Content-Length", str(len(out)))
-                    self.send_header("Cache-Control", "public, max-age=86400")
-                    self.end_headers(); self.wfile.write(out)
-                    return
-                except Exception as e:
-                    print(f"replay: precomputed read error {e}", file=sys.stderr)
-
-        # Slow path: render on demand, with cache
-        cache_key = (ep_id, idx, _replay_params_hash(rt, st))
-        cached = _replay_cache_get(cache_key)
-        if cached is not None:
-            self.send_response(200)
-            self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", str(len(cached)))
-            self.send_header("Cache-Control", "public, max-age=3600")
-            self.end_headers(); self.wfile.write(cached)
-            return
-
-        flows = eng.get_flows(ep_id, data)
-        flow = combined_flow(flows, idx, int(rt["flow_average_pairs"]),
-                             smooth_sigma=float(rt.get("flow_smooth_sigma", 2.0)))
-        if flow is None:
-            m_shape = data[idx][1].shape
-            flow = np.zeros((*m_shape, 2), dtype=np.float32)
-
-        ts, mask, mmh, _, _ = data[idx]
-        try:
-            png = build_replay_png(
-                None, mask, mmh, flow, eng.calib, ts, idx, len(data), ep_id,
-                eng.target_lat, eng.target_lon, rt, st,
-                eng.sri_legend, None,
-                stations=[],
-                data_dir=_VIZ_STATE.get("data_dir"))
-        except Exception as e:
-            print(f"replay: on-demand render error {e}", file=sys.stderr)
-            self.send_response(500); self.end_headers(); return
-
-        _replay_cache_put(cache_key, png)
-        self.send_response(200)
-        self.send_header("Content-Type", "image/png")
-        self.send_header("Content-Length", str(len(png)))
-        self.send_header("Cache-Control", "public, max-age=3600")
-        self.end_headers(); self.wfile.write(png)
-
-    def _config_get(self):
-        cfg_path = _VIZ_STATE.get("config_path")
-        if cfg_path and os.path.exists(cfg_path):
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            if cfg.get("static", {}).get("mapbox_token"):
-                cfg["static"]["mapbox_token"] = "***"
-            self._json(cfg)
-        else:
-            self._json({"version": 2, "note": "no config persisted",
-                        "runtime": _snapshot(), "static": _static_snapshot()})
-
-    def _config_post(self):
-        new_cfg = self._read_json_body()
-        if not isinstance(new_cfg, dict):
-            self._json({"ok": False, "error": "bad request"}, 400); return
-        cfg_path = _VIZ_STATE.get("config_path")
-        if not cfg_path:
-            self._json({"ok": False, "error": "no config path"}, 400); return
-        existing = _load_json_file(cfg_path) or {}
-        now = datetime.now(timezone.utc).isoformat()
-        if new_cfg.get("static", {}).get("mapbox_token") == "***":
-            new_cfg["static"]["mapbox_token"] = existing.get("static", {}).get("mapbox_token")
-        new_cfg.setdefault("version", 2)
-        new_cfg.setdefault("created_at", existing.get("created_at", now))
-        new_cfg["updated_at"] = now
-        if _save_json_file(cfg_path, new_cfg):
-            self._json({"ok": True, "restart_required": True, "path": cfg_path})
-        else:
-            self._json({"ok": False, "error": "save failed"}, 500)
-
-    def _accuracy(self, params):
-        acc = _VIZ_STATE.get("acc_store")
-        if not acc:
-            self._json({"error": "disabled"}, 503); return
-        self._json(acc.stats(since_hours=float(params["since_hours"]) if "since_hours" in params else None,
-                             tag=params.get("tag")))
-
-    def _accuracy_predictions(self, params):
-        acc = _VIZ_STATE.get("acc_store")
-        if not acc:
-            self._json({"error": "disabled"}, 503); return
-        self._json(acc.list_predictions(limit=int(params.get("n", 100))))
-
-    def _accuracy_events(self, params):
-        acc = _VIZ_STATE.get("acc_store")
-        if not acc:
-            self._json({"error": "disabled"}, 503); return
-        self._json(acc.list_outcomes(limit=int(params.get("n", 100))))
-
-    def _settings_post(self):
-        new = self._read_json_body()
-        if not isinstance(new, dict):
-            self._json({"ok": False, "error": "bad json"}, 400); return
-        with _RUNTIME_LOCK:
-            for k, v in new.items():
-                if k in _RUNTIME_TYPES:
-                    _RUNTIME[k] = _coerce(k, v)
-            current = dict(_RUNTIME)
-        _persist_runtime_to_disk()
-        self._json({"ok": True, "settings": current})
-
-    def _html(self, s):
-        body = s.encode("utf-8")
-        self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers(); self.wfile.write(body)
-
-    def log_message(self, *a):
-        pass
-
-
-# ---------------------------------------------------------------- 23.4 -----
-def start_web(port):
-    srv = ThreadingHTTPServer(("0.0.0.0", port), _VizHandler)
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    return srv
-
-
-# ============================================================================
 # SECTION 24 — CLI + main loop
 #   24.1  parse_sri_thresholds, parse_region
 #   24.2  build_arg_parser
-#   24.3  bootstrap_from_args  (config load, validation, static resolution)
-#   24.4  run_loop             (the while True cycle)
-#   24.5  main / entry point
+#   24.3  bootstrap_from_args
+#   24.4  run_loop
+#   24.5  main
 # ============================================================================
 
 # ---------------------------------------------------------------- 24.1 -----
@@ -3825,6 +3178,7 @@ def build_arg_parser():
     p.add_argument("--archive-min-pixels", type=int, dest="archive_min_pixels", default=None)
     p.add_argument("--archive-enabled", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--archive-precompute-replay", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--fit-check-overlay", action=argparse.BooleanOptionalAction, dest="fit_check_overlay", default=None)
     p.add_argument("--flow-downsample", type=int, dest="flow_downsample", default=None)
     p.add_argument("--flow-block-px", type=int, dest="flow_block_px", default=None)
     p.add_argument("--flow-search-px", type=int, dest="flow_search_px", default=None)
@@ -3890,11 +3244,6 @@ def build_arg_parser():
 
 # ---------------------------------------------------------------- 24.3 -----
 def bootstrap_from_args(args):
-    """Load config, merge CLI overrides, resolve target, build shared objects.
-
-    Returns a dict with all state needed by run_loop(). Exits via argparse
-    error on invalid input.
-    """
     data_dir = args.data_dir or None
     cfg_path = args.config or (os.path.join(data_dir, "config.json") if data_dir else None)
     existing_cfg = _load_json_file(cfg_path)
@@ -4038,7 +3387,6 @@ def run_loop(ctx, args):
                         or (now_utc - pljusak.last_fetch_utc).total_seconds() >= st["pljusak_interval"]):
                     pljusak.fetch(now_utc)
 
-            # --- Frame buffer (append-only) ---
             need_gif = (not frame_buffer) or args.once
             gif_img = None
             if need_gif:
@@ -4156,13 +3504,11 @@ def run_loop(ctx, args):
             data_age = ((now_utc - last_frame_ts).total_seconds() / 60.0
                         if last_frame_ts else None)
 
-            # --- Analyze all frames ---
             frames_list = [f for (_, f) in frame_buffer]
             times_list = [t for (t, _) in frame_buffer]
             masks_mmh = [analyze_frame(f, calib.map_region, st["radar_intensity"],
                                        sri_legend, legend_mask) for f in frames_list]
 
-            # --- Flow between consecutive frames ---
             flows = []
             for i in range(len(frames_list) - 1):
                 flows.append(estimate_flow_field(
@@ -4171,7 +3517,6 @@ def run_loop(ctx, args):
                     search_px=int(rt["flow_search_px"]),
                     downsample=int(rt["flow_downsample"])))
 
-            # --- Focus-crop the current mask ---
             current_mask, current_mmh = masks_mmh[-1]
             h_c, w_c = current_mask.shape
             focus_mask = calib.radius_mask(h_c, w_c, target_lat, target_lon,
@@ -4187,7 +3532,6 @@ def run_loop(ctx, args):
                 focus_mask_c, current_mmh, current_flow, calib,
                 target_lat, target_lon, rt, st)
 
-            # --- Rain history streak ---
             px, py = calib.latlon_to_image_pixel(target_lat, target_lon)
             xi, yi = int(round(px)), int(round(py))
             if 0 <= yi < h_c and 0 <= xi < w_c:
@@ -4204,7 +3548,6 @@ def run_loop(ctx, args):
                     else: break
                 nc.rain_duration_min = streak * eff_interval
 
-            # --- Local stations ---
             stations = []
             local_wx = LocalWeather(radius_km=float(rt.get("weather_radius_km", 5.0)))
             if pljusak and pljusak.last_readings:
@@ -4221,7 +3564,6 @@ def run_loop(ctx, args):
                 st["station_confirm_max_age_min"], st["station_confirm_fraction"],
                 st["station_confirm_min_count"])
 
-            # --- Archive (with precomputed replays) ---
             if archiver:
                 def _renderer_for_archive(frame, mask, mmh, flow, calib_, frame_ts,
                                           idx, total, ep_id):
@@ -4237,7 +3579,6 @@ def run_loop(ctx, args):
                 except Exception as e:
                     print(f"archive: error {e}", file=sys.stderr)
 
-            # --- Accuracy recording ---
             if acc_store.enabled:
                 now_iso = now_utc.isoformat()
                 tag = rt.get("settings_tag", "")
@@ -4259,7 +3600,6 @@ def run_loop(ctx, args):
                                       horizon_min=nc.rain_end_eta_min)
             prev_rain_state = ca.raining_now
 
-            # --- Basemap ---
             size_px = st["basemap_size"] or 640
             bm_choice = rt["basemap"]
             want_mapbox = (bm_choice == "mapbox") or (bm_choice == "auto" and bool(st["mapbox_token"]))
@@ -4291,7 +3631,6 @@ def run_loop(ctx, args):
                 if basemap_img is None and bm_choice == "none":
                     basemap_kind = "none"
 
-            # --- Render live outputs ---
             out_size = max(128, int(round(size_px * rt["web_scale"])))
             png_bytes = render_composed_png(
                 frames_list[-1], calib, target_lat, target_lon, rt["radius_km"],
@@ -4306,7 +3645,6 @@ def run_loop(ctx, args):
                 sri_legend, legend_mask, rt, st,
                 confirm_mm=st["station_confirm_min_mm"])
 
-            # --- Sensors ---
             radar_mmh = (round(float(current_mmh[yi, xi]), 1)
                          if (0 <= yi < current_mmh.shape[0] and 0 <= xi < current_mmh.shape[1]
                              and current_mask[yi, xi])
@@ -4393,9 +3731,6 @@ def run_loop(ctx, args):
             with _VIZ_STATE["lock"]:
                 _VIZ_STATE["png"] = png_bytes
                 _VIZ_STATE["gif"] = gif_bytes
-                _VIZ_STATE["raw_frame"] = frames_list[-1]
-                _VIZ_STATE["calib"] = calib
-                _VIZ_STATE["target"] = (target_lat, target_lon)
                 _VIZ_STATE["updated"] = now_utc.astimezone(display_tz).strftime("%Y-%m-%d %H:%M:%S %Z")
                 _VIZ_STATE["status"] = {
                     "target": target_name,
@@ -4452,18 +3787,12 @@ def run_loop(ctx, args):
 def main():
     p = build_arg_parser()
     args = p.parse_args()
-
     if args.list_cities:
         for label, name, lat, lon in CITIES:
             print(f"  {label:<4} {name:<18} ({lat:.4f}, {lon:.4f})")
         return
-
     ctx = bootstrap_from_args(args)
     run_loop(ctx, args)
-
-
-if __name__ == "__main__":
-    main()
 
 
 if __name__ == "__main__":
